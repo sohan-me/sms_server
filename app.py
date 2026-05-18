@@ -1,8 +1,9 @@
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, or_, text
 
 from models import (
     DEFAULT_MESSAGE_PUB,
@@ -48,6 +49,26 @@ def ensure_otp_message_message_pub_column():
         )
 
 
+def normalize_bd_phone(value):
+    """BD mobile inbox key: 01XXXXXXXXX. Handles +880…, 880…, 01…, dashes/spaces."""
+    if value is None:
+        return ""
+    s = re.sub(r"[\s\-()]+", "", str(value).strip())
+    if not s:
+        return ""
+    if s.startswith("+"):
+        s = s[1:]
+    digits = "".join(c for c in s if c.isdigit())
+    if not digits:
+        return ""
+    d = digits
+    if len(d) >= 12 and d.startswith("880") and len(d) > 3 and d[3] == "1":
+        d = d[3:]
+    if len(d) == 10 and d[0] == "1":
+        d = "0" + d
+    return d
+
+
 def _parse_message_pub(raw):
     """Return normalized publisher or None if invalid."""
     if raw is None:
@@ -76,7 +97,7 @@ def api_add_message():
     if not data:
         return jsonify({"error": "Invalid payload"}), 400
 
-    phone = data.get("phone")
+    phone = normalize_bd_phone(data.get("phone"))
     message = data.get("message")
     if not phone or not message:
         return jsonify({"error": "Missing phone or message"}), 400
@@ -89,6 +110,8 @@ def api_add_message():
                 "allowed": list(MESSAGE_PUB_CHOICES),
             }
         ), 400
+
+    message = str(message)[:199]
 
     new_msg = OTPMessage(phone=phone, otp_message=message, message_pub=pub)
     db.session.add(new_msg)
@@ -113,8 +136,13 @@ def api_get_messages(phone):
     OTPMessage.query.filter(OTPMessage.created_at < expiry_threshold).delete()
     db.session.commit()
 
+    norm = normalize_bd_phone(phone)
+    raw_key = str(phone or "").strip()
     messages = (
-        OTPMessage.query.filter_by(phone=phone, message_pub=pub)
+        OTPMessage.query.filter(
+            or_(OTPMessage.phone == norm, OTPMessage.phone == raw_key),
+            OTPMessage.message_pub == pub,
+        )
         .filter(OTPMessage.created_at >= expiry_threshold)
         .order_by(OTPMessage.id.asc())
         .all()
