@@ -119,9 +119,11 @@ def api_get_messages(phone):
         .order_by(OTPMessage.id.asc())
         .all()
     )
-    used = any(not m.is_used for m in messages)
     msg_list = [m.otp_message for m in messages]
     count = len(msg_list)
+    # `used` = true only after a prior GET already marked these rows (reload / "already seen").
+    # First GET for fresh rows: all is_used False → used false; we then set is_used True.
+    used = bool(messages) and all(m.is_used for m in messages)
 
     for m in messages:
         m.is_used = True
