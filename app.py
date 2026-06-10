@@ -7,7 +7,6 @@ from sqlalchemy import inspect, or_, text
 
 from models import (
     DEFAULT_MESSAGE_PUB,
-    MESSAGE_PUB_CHOICES,
     OTPMessage,
     db,
 )
@@ -69,17 +68,6 @@ def normalize_bd_phone(value):
     return d
 
 
-def _parse_message_pub(raw):
-    """Return normalized publisher or None if invalid."""
-    if raw is None:
-        return DEFAULT_MESSAGE_PUB
-    s = str(raw).strip()
-    if not s:
-        return DEFAULT_MESSAGE_PUB
-    if s not in MESSAGE_PUB_CHOICES:
-        return None
-    return s
-
 
 with app.app_context():
     db.create_all()
@@ -92,6 +80,7 @@ def index():
 
 
 @app.route("/api/messages", methods=["POST"])
+@app.route("/api/messages/", methods=["POST"])
 def api_add_message():
     data = request.json
     if not data:
@@ -102,7 +91,7 @@ def api_add_message():
     if not phone or not message:
         return jsonify({"error": "Missing phone or message"}), 400
 
-    pub = _parse_message_pub(data.get("message_pub"))
+    pub = data.get("message_pub")
     if pub is None:
         return jsonify(
             {
@@ -120,9 +109,9 @@ def api_add_message():
     return jsonify({"success": True, "message": "Message saved successfully"}), 201
 
 
-@app.route("/api/messages/<phone>", methods=["GET"])
+@app.route("/api/messages/<phone>", methods=["GET"], strict_slashes=False)
 def api_get_messages(phone):
-    pub = _parse_message_pub(request.args.get("message_pub"))
+    pub = request.args.get("message_pub")
     if pub is None:
         return jsonify(
             {

@@ -3,7 +3,6 @@ from datetime import datetime
 
 db = SQLAlchemy()
 
-MESSAGE_PUB_CHOICES = ("IVAC", "VFS")
 DEFAULT_MESSAGE_PUB = "IVAC"
 
 
