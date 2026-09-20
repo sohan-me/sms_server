@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+{% block title %}Devices · OrbitalCore{% endblock %}
+
+{% block head %}
+<style>
+  .page-head h1 {
+    font-family: var(--font-display);
+    font-size: 1.75rem;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    margin: 0 0 0.35rem;
+  }
+  .page-head p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+  .stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin: 1.5rem 0;
+  }
+  .stat {
+    padding: 0.85rem 1.15rem;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: rgba(255,255,255,0.03);
+    min-width: 120px;
+  }
+  .stat strong {
+    display: block;
+    font-family: var(--font-display);
+    font-size: 1.4rem;
+    color: var(--cyan);
+  }
+  .stat span { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .add-panel {
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .add-panel h2 {
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    margin: 0 0 1rem;
+  }
+  .grid-form {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.85rem 1rem;
+  }
+  .grid-form .field-span { grid-column: 1 / -1; }
+  .actions-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  .token-cell { max-width: 14rem; }
+  .token-row { display: flex; gap: 0.4rem; align-items: flex-start; }
+  details.add-details summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--cyan);
+    list-style: none;
+  }
+  details.add-details summary::-webkit-details-marker { display: none; }
+  details.add-details[open] summary { margin-bottom: 1rem; }
+  @media (max-width: 800px) {
+    .grid-form { grid-template-columns: 1fr; }
+  }
+</style>
+{% endblock %}
+
+{% block body %}
+{% set total = users|length %}
+{% set active_n = users|selectattr('is_active')|list|length %}
+{% set pending_n = users|rejectattr('is_active')|rejectattr('is_expired')|list|length %}
+
+<div class="shell">
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('admin_dashboard') }}">
+      <span class="brand-mark" aria-hidden="true"></span>
+      Orbital<span class="accent">Core</span>
+    </a>
+    <div class="topbar-meta">
+      <span>{{ session.get('username', 'admin') }}</span>
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('admin_logout') }}">Log out</a>
+    </div>
+  </header>
+
+  <div class="page-head">
+    <h1>Device management</h1>
+    <p>Approve hardware licenses and manage per-user WSS auth tokens.</p>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+  <div class="flash-wrap" style="margin-top:1.25rem;">
+    {% for category, message in messages %}
+    <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% endwith %}
+
+  <div class="stats">
+    <div class="stat"><strong>{{ total }}</strong><span>Total</span></div>
+    <div class="stat"><strong>{{ active_n }}</strong><span>Active</span></div>
+    <div class="stat"><strong>{{ pending_n }}</strong><span>Pending</span></div>
+  </div>
+
+  <div class="panel add-panel">
+    <details class="add-details">
+      <summary>+ Add device user</summary>
+      <form method="POST" action="{{ url_for('admin_add_user') }}">
+        <div class="grid-form">
+          <div class="field">
+            <label for="name">Name</label>
+            <input class="form-control" id="name" name="name" required>
+          </div>
+          <div class="field">
+            <label for="mac_address">MAC</label>
+            <input class="form-control" id="mac_address" name="mac_address">
+          </div>
+          <div class="field">
+            <label for="machine_guid">GUID</label>
+            <input class="form-control" id="machine_guid" name="machine_guid">
+          </div>
+          <div class="field">
+            <label for="motherboard_serial">Motherboard</label>
+            <input class="form-control" id="motherboard_serial" name="motherboard_serial">
+          </div>
+          <div class="field">
+            <label for="bios_serial">BIOS</label>
+            <input class="form-control" id="bios_serial" name="bios_serial">
+          </div>
+          <div class="field" style="display:flex;align-items:flex-end;">
+            <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;">
+              <input type="checkbox" name="is_active" value="1">
+              Activate immediately
+            </label>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:0.5rem;">Create user</button>
+      </form>
+    </details>
+  </div>
+
+  <div class="panel" style="padding:1rem 1rem 0.5rem;">
+    <div class="table-scroll">
+      <table class="oc-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Signatures</th>
+            <th>Auth token</th>
+            <th>Created</th>
+            <th>Expires (UTC)</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for user in users %}
+          <tr>
+            <td style="color:var(--muted);">{{ user.id }}</td>
+            <td style="font-weight:600;">{{ user.name or '—' }}</td>
+            <td>
+              <div class="sig-line"><strong>MAC</strong> {{ user.mac_address or '—' }}</div>
+              <div class="sig-line"><strong>MB</strong> {{ user.motherboard_serial or '—' }}</div>
+              <div class="sig-line"><strong>GUID</strong> {{ user.machine_guid or '—' }}</div>
+              <div class="sig-line"><strong>BIOS</strong> {{ user.bios_serial or '—' }}</div>
+            </td>
+            <td class="token-cell">
+              {% if user.ws_token %}
+              <div class="token-row">
+                <code class="token" id="tok-{{ user.id }}">{{ user.ws_token }}</code>
+                <button type="button" class="btn btn-sm btn-icon" title="Copy"
+                  onclick="copyToken('tok-{{ user.id }}', this)">⎘</button>
+              </div>
+              <form method="POST" action="{{ url_for('regen_user_ws_token', user_id=user.id) }}"
+                onsubmit="return confirm('Regenerate token? The old token stops working immediately.');"
+                style="margin-top:0.4rem;">
+                <button type="submit" class="btn btn-sm btn-ghost" style="color:var(--amber);padding-left:0;">Regenerate</button>
+              </form>
+              {% else %}
+              <span style="color:var(--muted);">—</span>
+              {% endif %}
+            </td>
+            <td style="color:var(--muted);font-size:0.85rem;">
+              {{ user.created_at.strftime('%Y-%m-%d %H:%M') if user.created_at else '—' }}
+            </td>
+            <td style="min-width:12rem;">
+              <div style="color:var(--muted);font-size:0.8rem;margin-bottom:0.4rem;">
+                {% if user.expires_at %}{{ user.expires_at.strftime('%Y-%m-%d %H:%M') }} UTC{% else %}Never{% endif %}
+              </div>
+              <form method="POST" action="{{ url_for('update_user_expiry', user_id=user.id) }}" class="actions-row">
+                <input class="form-control" type="datetime-local" name="expires_at"
+                  style="padding:0.35rem 0.5rem;font-size:0.8rem;min-width:10rem;"
+                  value="{% if user.expires_at %}{{ user.expires_at.strftime('%Y-%m-%dT%H:%M') }}{% endif %}">
+                <button type="submit" class="btn btn-sm">Save</button>
+                <button type="submit" name="clear_expiry" value="1" class="btn btn-sm btn-ghost" formnovalidate>Clear</button>
+              </form>
+            </td>
+            <td>
+              {% if user.is_expired %}
+              <span class="badge badge-expired">Expired</span>
+              {% elif user.is_active %}
+              <span class="badge badge-active">Active</span>
+              {% else %}
+              <span class="badge badge-pending">Pending</span>
+              {% endif %}
+            </td>
+            <td>
+              <div class="actions-row">
+                <form method="POST" action="{{ url_for('toggle_user', user_id=user.id) }}">
+                  {% if user.is_active %}
+                  <button type="submit" class="btn btn-sm" title="Revoke">Revoke</button>
+                  {% else %}
+                  <button type="submit" class="btn btn-sm btn-primary" title="Activate">Activate</button>
+                  {% endif %}
+                </form>
+                <form method="POST" action="{{ url_for('delete_user', user_id=user.id) }}"
+                  onsubmit="return confirm('Permanently delete this device?');">
+                  <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="8" class="empty">No devices registered yet. Add one above or wait for API registration.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+function copyToken(id, btn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  navigator.clipboard.writeText(el.textContent.trim()).then(() => {
+    const prev = btn.textContent;
+    btn.textContent = '✓';
+    setTimeout(() => { btn.textContent = prev; }, 1200);
+  });
+}
+</script>
+{% endblock %}
