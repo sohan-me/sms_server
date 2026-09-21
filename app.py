@@ -87,6 +87,73 @@ def normalize_bd_phone(value):
     return d
 
 
+NUMBER_WORD_TO_DIGIT = {
+    "zero": "0",
+    "oh": "0",
+    "o": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+}
+
+
+def _extract_normalized_otp(raw):
+    """Turn IVAC word OTPs / spaced digits into a digit string."""
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+
+    # 1) Number-word run (≥4 words): Five-Six-Nine-One-Two-Five → 569125
+    tokens = re.findall(r"[a-z]+", text.lower())
+    best = []
+    current = []
+    for tok in tokens:
+        if tok in NUMBER_WORD_TO_DIGIT:
+            current.append(NUMBER_WORD_TO_DIGIT[tok])
+        else:
+            if len(current) > len(best):
+                best = current
+            current = []
+    if len(current) > len(best):
+        best = current
+    if len(best) >= 4:
+        return "".join(best)
+
+    # 2) Spaced/hyphenated digits: 2-5-7-0-0-7
+    spaced = re.findall(r"(?:\d[\s\-]+){3,}\d", text)
+    if spaced:
+        return re.sub(r"\D", "", spaced[-1])
+
+    # 3) Contiguous 4–8 digit block (last match), else longest digit run
+    blocks = re.findall(r"\d{4,8}", text)
+    if blocks:
+        return blocks[-1]
+    runs = re.findall(r"\d+", text)
+    if runs:
+        return max(runs, key=len)
+
+    return ""
+
+
+def _format_bdt(dt=None):
+    bdt_tz = timezone(timedelta(hours=6))
+    if dt is None:
+        now = datetime.now(bdt_tz)
+    elif dt.tzinfo is None:
+        now = dt.replace(tzinfo=timezone.utc).astimezone(bdt_tz)
+    else:
+        now = dt.astimezone(bdt_tz)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+06:00"
+
+
 def ensure_schema_columns():
     insp = inspect(db.engine)
     tables = set(insp.get_table_names())
@@ -164,17 +231,6 @@ def _drop_user_ws(user_id):
         client.close(4003, "Access revoked")
     except Exception:
         pass
-
-
-def _format_bdt(dt=None):
-    bdt_tz = timezone(timedelta(hours=6))
-    if dt is None:
-        now = datetime.now(bdt_tz)
-    elif dt.tzinfo is None:
-        now = dt.replace(tzinfo=timezone.utc).astimezone(bdt_tz)
-    else:
-        now = dt.astimezone(bdt_tz)
-    return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+06:00"
 
 
 with app.app_context():
@@ -330,15 +386,17 @@ def api_add_message():
     db.session.add(new_msg)
     db.session.commit()
 
-    _broadcast_otp(
-        {
-            "id": new_msg.id,
-            "otp": new_msg.otp_message,
-            "phone": new_msg.phone,
-            "used": bool(new_msg.is_used),
-            "created_at": _format_bdt(new_msg.created_at),
-        }
-    )
+    otp_digits = _extract_normalized_otp(message)
+    if otp_digits:
+        _broadcast_otp(
+            {
+                "id": new_msg.id,
+                "otp": otp_digits,
+                "phone": new_msg.phone,
+                "used": bool(new_msg.is_used),
+                "created_at": _format_bdt(new_msg.created_at),
+            }
+        )
 
     return jsonify({"success": True, "message": "Message saved successfully"}), 201
 
@@ -360,7 +418,14 @@ def api_get_messages(phone):
         .order_by(OTPMessage.id.asc())
         .all()
     )
-    msg_list = [m.otp_message for m in messages]
+
+    # Only return normalized digit OTPs (drops junk like "test-no-pub")
+    msg_list = []
+    for m in messages:
+        digits = _extract_normalized_otp(m.otp_message)
+        if digits:
+            msg_list.append(digits)
+
     count = len(msg_list)
     used = bool(messages) and all(m.is_used for m in messages)
 
