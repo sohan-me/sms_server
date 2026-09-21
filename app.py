@@ -19,7 +19,6 @@ from sqlalchemy import inspect, or_, text
 
 from models import (
     DEFAULT_MESSAGE_PUB,
-    MESSAGE_PUB_CHOICES,
     AdminUser,
     DeviceUser,
     OTPMessage,
@@ -322,17 +321,12 @@ def api_add_message():
     if not phone or not message:
         return jsonify({"error": "Missing phone or message"}), 400
 
-    pub = data.get("message_pub")
-    if pub is None or pub not in MESSAGE_PUB_CHOICES:
-        return jsonify(
-            {
-                "error": "Invalid message_pub",
-                "allowed": list(MESSAGE_PUB_CHOICES),
-            }
-        ), 400
-
     message = str(message)[:199]
-    new_msg = OTPMessage(phone=phone, otp_message=message, message_pub=pub)
+    new_msg = OTPMessage(
+        phone=phone,
+        otp_message=message,
+        message_pub=DEFAULT_MESSAGE_PUB,
+    )
     db.session.add(new_msg)
     db.session.commit()
 
@@ -342,7 +336,6 @@ def api_add_message():
             "otp": new_msg.otp_message,
             "phone": new_msg.phone,
             "used": bool(new_msg.is_used),
-            "message_pub": new_msg.message_pub,
             "created_at": _format_bdt(new_msg.created_at),
         }
     )
@@ -352,15 +345,6 @@ def api_add_message():
 
 @app.route("/api/messages/<phone>", methods=["GET"], strict_slashes=False)
 def api_get_messages(phone):
-    pub = request.args.get("message_pub")
-    if pub is None or pub not in MESSAGE_PUB_CHOICES:
-        return jsonify(
-            {
-                "error": "Invalid message_pub",
-                "allowed": list(MESSAGE_PUB_CHOICES),
-            }
-        ), 400
-
     retention = _otp_retention_minutes()
     expiry_threshold = datetime.utcnow() - timedelta(minutes=retention)
     OTPMessage.query.filter(OTPMessage.created_at < expiry_threshold).delete()
@@ -371,7 +355,6 @@ def api_get_messages(phone):
     messages = (
         OTPMessage.query.filter(
             or_(OTPMessage.phone == norm, OTPMessage.phone == raw_key),
-            OTPMessage.message_pub == pub,
         )
         .filter(OTPMessage.created_at >= expiry_threshold)
         .order_by(OTPMessage.id.asc())
@@ -392,7 +375,6 @@ def api_get_messages(phone):
             "count": count,
             "messages": msg_list,
             "checkedAt": _format_bdt(),
-            "messagePub": pub,
         }
     ), 200
 

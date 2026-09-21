@@ -6,8 +6,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 db = SQLAlchemy()
 
+# OTP inbox is IVAC-only; column kept for DB compatibility.
 DEFAULT_MESSAGE_PUB = "IVAC"
-MESSAGE_PUB_CHOICES = ("IVAC", "VFS", "OTHER")
 
 
 def generate_ws_token():
