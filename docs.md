@@ -59,6 +59,25 @@ GET https://server.orbitalcore.site/api/messages/01712345678
 
 No `message_pub` needed (IVAC-only).
 
+Response is an array; each OTP has its own fields (`count` is 1-based order):
+
+```json
+[
+  {
+    "checkedAt": "2026-09-22T02:37:00.124+06:00",
+    "count": 1,
+    "message": "569125",
+    "used": false
+  },
+  {
+    "checkedAt": "2026-09-22T02:37:00.124+06:00",
+    "count": 2,
+    "message": "569127",
+    "used": true
+  }
+]
+```
+
 ## Checklist
 
 - [ ] `wss://` (not `ws://`)

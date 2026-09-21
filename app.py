@@ -420,28 +420,27 @@ def api_get_messages(phone):
     )
 
     # Only return normalized digit OTPs (drops junk like "test-no-pub")
+    checked_at = _format_bdt()
     msg_list = []
     for m in messages:
         digits = _extract_normalized_otp(m.otp_message)
-        if digits:
-            msg_list.append(digits)
-
-    count = len(msg_list)
-    used = bool(messages) and all(m.is_used for m in messages)
+        if not digits:
+            continue
+        msg_list.append(
+            {
+                "checkedAt": checked_at,
+                "count": len(msg_list) + 1,
+                "message": digits,
+                "used": bool(m.is_used),
+            }
+        )
 
     for m in messages:
         m.is_used = True
     if messages:
         db.session.commit()
 
-    return jsonify(
-        {
-            "used": used,
-            "count": count,
-            "messages": msg_list,
-            "checkedAt": _format_bdt(),
-        }
-    ), 200
+    return jsonify(msg_list), 200
 
 
 # ── WebSocket ──────────────────────────────────────────────────
