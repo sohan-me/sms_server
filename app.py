@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -39,8 +40,8 @@ app.config["WS_AUTH_TOKEN"] = os.environ.get("WS_AUTH_TOKEN", "").strip() or Non
 
 db.init_app(app)
 sock = Sock(app)
-app.ws_clients = {}  # user_id -> websocket
-app.ws_client = None  # legacy global token slot
+app.ws_clients = {}  # connection_id -> {ws, user_id, phones}
+app.ws_clients_lock = threading.RLock()
 
 MIN_SIGNATURE_FIELDS = 2
 
@@ -208,29 +209,109 @@ def backfill_missing_ws_tokens():
 
 def _broadcast_otp(payload: dict):
     ws_msg = json.dumps(payload)
+    phone = normalize_bd_phone(payload.get("phone"))
+    with app.ws_clients_lock:
+        clients = list(app.ws_clients.items())
+
     dead = []
-    for user_id, client in list(app.ws_clients.items()):
+    for connection_id, client_data in clients:
+        if phone not in client_data["phones"]:
+            continue
         try:
-            client.send(ws_msg)
+            client_data["ws"].send(ws_msg)
         except Exception:
-            dead.append(user_id)
-    for user_id in dead:
-        app.ws_clients.pop(user_id, None)
-    if app.ws_client:
-        try:
-            app.ws_client.send(ws_msg)
-        except Exception:
-            app.ws_client = None
+            dead.append((connection_id, client_data["ws"]))
+
+    with app.ws_clients_lock:
+        for connection_id, client in dead:
+            current = app.ws_clients.get(connection_id)
+            if current and current["ws"] is client:
+                app.ws_clients.pop(connection_id, None)
 
 
 def _drop_user_ws(user_id):
-    client = app.ws_clients.pop(user_id, None)
-    if client is None:
-        return
+    with app.ws_clients_lock:
+        clients = [
+            (connection_id, client_data["ws"])
+            for connection_id, client_data in app.ws_clients.items()
+            if client_data["user_id"] == user_id
+        ]
+        for connection_id, _ in clients:
+            app.ws_clients.pop(connection_id, None)
+
+    for _, client in clients:
+        try:
+            client.close(4003, "Access revoked")
+        except Exception:
+            pass
+
+
+def _parse_subscription(raw_message):
     try:
-        client.close(4003, "Access revoked")
+        data = json.loads(raw_message)
+    except (TypeError, ValueError):
+        return None, "Invalid JSON"
+
+    if not isinstance(data, dict) or data.get("action") != "subscribe":
+        return None, "Expected a subscribe action"
+
+    raw_phones = data.get("phones")
+    if not isinstance(raw_phones, list) or not raw_phones:
+        return None, "phones must be a non-empty array"
+
+    phones = set()
+    for raw_phone in raw_phones:
+        if not isinstance(raw_phone, str):
+            return None, "Each phone must be a string"
+        phone = normalize_bd_phone(raw_phone)
+        if not phone:
+            return None, "Each phone must contain digits"
+        phones.add(phone)
+
+    return phones, None
+
+
+def _serve_ws_connection(ws, user_id):
+    connection_id = id(ws)
+    with app.ws_clients_lock:
+        app.ws_clients[connection_id] = {
+            "ws": ws,
+            "user_id": user_id,
+            "phones": set(),
+        }
+
+    try:
+        while True:
+            raw_message = ws.receive()
+            if raw_message is None:
+                break
+
+            phones, error = _parse_subscription(raw_message)
+            if error:
+                ws.send(json.dumps({"type": "error", "error": error}))
+                continue
+
+            with app.ws_clients_lock:
+                client_data = app.ws_clients.get(connection_id)
+                if not client_data or client_data["ws"] is not ws:
+                    break
+                client_data["phones"] = phones
+
+            ws.send(
+                json.dumps(
+                    {
+                        "type": "subscribed",
+                        "phones": sorted(phones),
+                    }
+                )
+            )
     except Exception:
         pass
+    finally:
+        with app.ws_clients_lock:
+            client_data = app.ws_clients.get(connection_id)
+            if client_data and client_data["ws"] is ws:
+                app.ws_clients.pop(connection_id, None)
 
 
 with app.app_context():
@@ -420,7 +501,6 @@ def api_get_messages(phone):
     )
 
     # Only return normalized digit OTPs (drops junk like "test-no-pub")
-    checked_at = _format_bdt()
     msg_list = []
     for m in messages:
         digits = _extract_normalized_otp(m.otp_message)
@@ -428,7 +508,7 @@ def api_get_messages(phone):
             continue
         msg_list.append(
             {
-                "checkedAt": checked_at,
+                "checkedAt": _format_bdt(m.created_at),
                 "count": len(msg_list) + 1,
                 "message": digits,
                 "used": bool(m.is_used),
@@ -464,35 +544,12 @@ def ws_otp(ws):
             ws.close(4003, "Inactive")
             return
 
-        user_id = user.id
-        old = app.ws_clients.get(user_id)
-        if old is not None and old is not ws:
-            try:
-                old.close(4002, "Replaced")
-            except Exception:
-                pass
-        app.ws_clients[user_id] = ws
-        try:
-            while True:
-                ws.receive(timeout=30)
-        except Exception:
-            pass
-        finally:
-            if app.ws_clients.get(user_id) is ws:
-                app.ws_clients.pop(user_id, None)
+        _serve_ws_connection(ws, user.id)
         return
 
     global_token = app.config.get("WS_AUTH_TOKEN")
     if global_token and token == global_token:
-        app.ws_client = ws
-        try:
-            while True:
-                ws.receive(timeout=30)
-        except Exception:
-            pass
-        finally:
-            if app.ws_client is ws:
-                app.ws_client = None
+        _serve_ws_connection(ws, None)
         return
 
     ws.close(4001, "Unauthorized")
