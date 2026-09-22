@@ -46,7 +46,22 @@ Example message from the server:
 }
 ```
 
-Use `phone` to identify which number received the OTP.
+Every OTP response includes `phone`. Use it to identify which number received
+the OTP, even when several subscribed numbers receive OTPs at the same time.
+
+## Update numbers without reconnecting
+
+Send another subscription on the same open WebSocket:
+
+```json
+{
+  "action": "subscribe",
+  "phones": ["01612345678", "01512345678"]
+}
+```
+
+This replaces the old list completely. New numbers start receiving OTPs, and
+removed numbers stop receiving OTPs immediately.
 
 ## Python example
 
