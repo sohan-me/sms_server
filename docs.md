@@ -2,6 +2,20 @@
 
 Give this guide to your bot developer or coding agent.
 
+## Get an auth token
+
+Call `POST /api/authenticate` with any two or more device fingerprint fields:
+
+```json
+{
+  "mac_address": "DEVICE_MAC",
+  "machine_guid": "DEVICE_GUID"
+}
+```
+
+At least two supplied fields must match the same registered user. Use the
+returned `ws_token` to connect. WebSocket connections use the token only.
+
 ## 1. Connect
 
 ```text
@@ -97,3 +111,16 @@ while True:
 ```text
 GET https://server.orbitalcore.site/api/messages/01712345678
 ```
+
+## Server deployment
+
+When running multiple server workers or instances, set the same `REDIS_URL` for
+every worker:
+
+```text
+REDIS_URL=redis://127.0.0.1:6379/0
+```
+
+Redis forwards each saved OTP to every worker. Each worker then sends it only
+to its local WebSocket connections subscribed to that phone number. Without
+`REDIS_URL`, in-memory delivery is suitable only for a single server process.

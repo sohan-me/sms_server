@@ -17,7 +17,7 @@ from app import (  # noqa: E402
     _serve_ws_connection,
     app,
 )
-from models import OTPMessage, db  # noqa: E402
+from models import DeviceUser, OTPMessage, db  # noqa: E402
 
 
 class FakeSocket:
@@ -165,6 +165,97 @@ class OTPServerTests(unittest.TestCase):
             [_format_bdt(first_time), _format_bdt(second_time)],
         )
         self.assertNotEqual(payload[0]["checkedAt"], payload[1]["checkedAt"])
+
+    def test_authentication_accepts_any_two_matching_fingerprint_fields(self):
+        with app.app_context():
+            user = DeviceUser(
+                name="Two Field User",
+                mac_address="AA:BB:CC:DD:EE:01",
+                motherboard_serial="MB-ONE",
+                machine_guid="GUID-ONE",
+                bios_serial="BIOS-ONE",
+                ws_token="two-field-token",
+                is_active=True,
+            )
+            db.session.add(user)
+            db.session.commit()
+
+        response = app.test_client().post(
+            "/api/authenticate",
+            json={
+                "mac_address": "AA:BB:CC:DD:EE:01",
+                "machine_guid": "GUID-ONE",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["ws_token"], "two-field-token")
+
+    def test_authentication_rejects_fewer_than_two_matches(self):
+        with app.app_context():
+            db.session.add(
+                DeviceUser(
+                    name="Mismatch User",
+                    mac_address="AA:BB:CC:DD:EE:02",
+                    motherboard_serial="MB-TWO",
+                    machine_guid="GUID-TWO",
+                    bios_serial="BIOS-TWO",
+                    ws_token="mismatch-token",
+                    is_active=True,
+                )
+            )
+            db.session.commit()
+
+        response = app.test_client().post(
+            "/api/authenticate",
+            json={
+                "mac_address": "AA:BB:CC:DD:EE:02",
+                "machine_guid": "WRONG-GUID",
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["error"], "Device not found")
+
+    def test_authentication_rejects_ambiguous_two_field_match(self):
+        with app.app_context():
+            db.session.add_all(
+                [
+                    DeviceUser(
+                        name="First Shared Device",
+                        mac_address="AA:BB:CC:DD:EE:03",
+                        motherboard_serial="SHARED-MB",
+                        machine_guid="SHARED-GUID",
+                        bios_serial="BIOS-THREE",
+                        ws_token="shared-token-one",
+                        is_active=True,
+                    ),
+                    DeviceUser(
+                        name="Second Shared Device",
+                        mac_address="AA:BB:CC:DD:EE:04",
+                        motherboard_serial="SHARED-MB",
+                        machine_guid="SHARED-GUID",
+                        bios_serial="BIOS-FOUR",
+                        ws_token="shared-token-two",
+                        is_active=True,
+                    ),
+                ]
+            )
+            db.session.commit()
+
+        response = app.test_client().post(
+            "/api/authenticate",
+            json={
+                "motherboard_serial": "SHARED-MB",
+                "machine_guid": "SHARED-GUID",
+            },
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.get_json()["error"],
+            "Ambiguous device fingerprint",
+        )
 
 
 def tearDownModule():

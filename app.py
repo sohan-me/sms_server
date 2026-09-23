@@ -18,6 +18,7 @@ from flask import (
 from flask_sock import Sock
 from sqlalchemy import inspect, or_, text
 
+from otp_broker import OTPBroker
 from models import (
     DEFAULT_MESSAGE_PUB,
     AdminUser,
@@ -67,6 +68,39 @@ def _normalize_device_signatures(data):
     bios = _norm_sig(data.get("bios_serial"))
     count = sum(1 for v in (mac, mb, guid, bios) if v)
     return mac, mb, guid, bios, count
+
+
+def _find_user_by_signatures(mac, mb, guid, bios):
+    provided = {
+        "mac_address": mac,
+        "motherboard_serial": mb,
+        "machine_guid": guid,
+        "bios_serial": bios,
+    }
+    provided = {name: value for name, value in provided.items() if value}
+    clauses = [
+        getattr(DeviceUser, name) == value
+        for name, value in provided.items()
+    ]
+    if len(clauses) < MIN_SIGNATURE_FIELDS:
+        return None, "insufficient"
+
+    candidates = DeviceUser.query.filter(or_(*clauses)).all()
+    matches = [
+        user
+        for user in candidates
+        if sum(
+            1
+            for name, value in provided.items()
+            if getattr(user, name) == value
+        )
+        >= MIN_SIGNATURE_FIELDS
+    ]
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, "ambiguous"
+    return None, "not_found"
 
 
 def normalize_bd_phone(value):
@@ -228,6 +262,11 @@ def _broadcast_otp(payload: dict):
             if current and current["ws"] is client:
                 app.ws_clients.pop(connection_id, None)
 
+otp_broker = OTPBroker(
+    redis_url=os.environ.get("REDIS_URL"),
+    on_message=_broadcast_otp,
+)
+
 
 def _drop_user_ws(user_id):
     with app.ws_clients_lock:
@@ -272,6 +311,7 @@ def _parse_subscription(raw_message):
 
 
 def _serve_ws_connection(ws, user_id):
+    otp_broker.start()
     connection_id = id(ws)
     with app.ws_clients_lock:
         app.ws_clients[connection_id] = {
@@ -410,14 +450,11 @@ def api_authenticate():
             {"error": "At least 2 device signature fields are required"}
         ), 400
 
-    user = DeviceUser.query.filter_by(
-        mac_address=mac,
-        motherboard_serial=mb,
-        machine_guid=guid,
-        bios_serial=bios,
-    ).first()
+    user, match_error = _find_user_by_signatures(mac, mb, guid, bios)
 
     if not user:
+        if match_error == "ambiguous":
+            return jsonify({"error": "Ambiguous device fingerprint"}), 409
         return jsonify({"error": "Device not found"}), 404
 
     if user.expires_at and user.expires_at <= datetime.utcnow():
@@ -469,7 +506,7 @@ def api_add_message():
 
     otp_digits = _extract_normalized_otp(message)
     if otp_digits:
-        _broadcast_otp(
+        otp_broker.publish(
             {
                 "id": new_msg.id,
                 "otp": otp_digits,
@@ -534,6 +571,7 @@ def ws_otp(ws):
         return
 
     user = DeviceUser.query.filter_by(ws_token=token).first()
+    global_token = app.config.get("WS_AUTH_TOKEN")
     if user:
         if user.is_expired:
             user.is_active = False
@@ -547,7 +585,6 @@ def ws_otp(ws):
         _serve_ws_connection(ws, user.id)
         return
 
-    global_token = app.config.get("WS_AUTH_TOKEN")
     if global_token and token == global_token:
         _serve_ws_connection(ws, None)
         return
