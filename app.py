@@ -2,6 +2,7 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -242,6 +243,23 @@ def backfill_missing_ws_tokens():
 
 
 def _broadcast_otp(payload: dict):
+    # Deduplicate local+Redis echo of the same OTP id on one worker.
+    msg_id = payload.get("id")
+    if msg_id is not None:
+        key = str(msg_id)
+        now = time.time()
+        with app.ws_clients_lock:
+            seen = getattr(app, "_otp_broadcast_seen", None)
+            if seen is None:
+                seen = {}
+                app._otp_broadcast_seen = seen
+            expired = [k for k, ts in seen.items() if now - ts > 60]
+            for k in expired:
+                seen.pop(k, None)
+            if key in seen:
+                return
+            seen[key] = now
+
     ws_msg = json.dumps(payload)
     phone = normalize_bd_phone(payload.get("phone"))
     with app.ws_clients_lock:
@@ -266,6 +284,8 @@ otp_broker = OTPBroker(
     redis_url=os.environ.get("REDIS_URL"),
     on_message=_broadcast_otp,
 )
+# Start Redis subscriber at boot so this worker is ready before any WS client connects.
+otp_broker.start()
 
 
 def _drop_user_ws(user_id):

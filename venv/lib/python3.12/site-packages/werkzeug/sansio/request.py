@@ -67,10 +67,8 @@ class Request:
 
     #: the class to use for `args` and `form`.  The default is an
     #: :class:`~werkzeug.datastructures.ImmutableMultiDict` which supports
-    #: multiple values per key.  alternatively it makes sense to use an
-    #: :class:`~werkzeug.datastructures.ImmutableOrderedMultiDict` which
-    #: preserves order or a :class:`~werkzeug.datastructures.ImmutableDict`
-    #: which is the fastest but only remembers the last key.  It is also
+    #: multiple values per key. A :class:`~werkzeug.datastructures.ImmutableDict`
+    #: is faster but only remembers the last key. It is also
     #: possible to use mutable structures, but this is not recommended.
     #:
     #: .. versionadded:: 0.6
@@ -232,6 +230,8 @@ class Request:
     def host(self) -> str:
         """The host name the request was made to, including the port if
         it's non-standard. Validated with :attr:`trusted_hosts`.
+
+        See :func:`.get_host` for a detailed explanation.
         """
         return get_host(
             self.scheme, self.headers.get("host"), self.server, self.trusted_hosts

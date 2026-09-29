@@ -1,4 +1,4 @@
-#!/home/ripnoob/Desktop/Production/server/venv/bin/python
+#!/home/ripnoob/Desktop/Bots/Incomplete/server/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
