@@ -111,6 +111,21 @@ Never start `app.py` directly — its `__main__` block runs the Werkzeug dev ser
 `debug=True`, whose reloader spawns a second process that re-imports the app and opens
 a duplicate Redis subscriber.
 
+The app listens on **port 8002** by default (`BIND` in `ecosystem.config.js` and
+`gunicorn.conf.py`). Point your reverse proxy upstream at `127.0.0.1:8002`, and make
+sure it forwards WebSocket upgrade headers:
+
+```nginx
+location /ws/ {
+    proxy_pass http://127.0.0.1:8002;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 3600s;   # long-lived WS; default 60s would drop them
+}
+```
+
 Every worker runs the schema/admin bootstrap at import, so that setup is wrapped in a
 savepoint and retried: otherwise all workers race to create the default admin row, the
 losers hit a UNIQUE violation, and the master shuts the whole app down with

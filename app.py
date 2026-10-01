@@ -388,18 +388,11 @@ def _serve_ws_connection(ws, user_id):
 
 
 def _configure_sqlite_concurrency(dbapi_connection, _record):
-    # busy_timeout is per-connection, so it must be re-applied to every new
-    # connection. Concurrent workers otherwise raise "database is locked"
-    # immediately instead of waiting for the writer to finish.
     dbapi_connection.execute("PRAGMA busy_timeout=5000")
 
 
 def _enable_sqlite_wal():
-    """Set WAL once, on its own autocommit connection.
-
-    WAL is a persistent property of the database file, and the PRAGMA cannot run
-    inside a transaction — so it must happen outside the schema setup savepoint.
-    """
+    """WAL cannot be set inside a transaction, so it needs its own connection."""
     raw = db.engine.raw_connection()
     try:
         raw.connection.execute("PRAGMA journal_mode=WAL")
@@ -408,13 +401,8 @@ def _enable_sqlite_wal():
 
 
 def _run_startup_schema_setup():
-    """Idempotent boot-time setup, safe when every gunicorn worker runs it at once.
-
-    Each worker executes this concurrently, so a check-then-insert would race:
-    all workers see an empty table and all INSERT, and the UNIQUE violation kills
-    the worker (which takes the whole app down with it). Wrapping in a savepoint
-    makes the loser roll back and carry on.
-    """
+    """Every worker runs this concurrently, so a check-then-insert would race and
+    the UNIQUE violation would kill the worker. Retrying makes the loser recover."""
     for attempt in range(5):
         try:
             with db.session.begin_nested():
@@ -436,9 +424,7 @@ def _run_startup_schema_setup():
                 )
                 raise
             logging.getLogger(__name__).info(
-                "Startup schema setup lost a race with another worker, retrying "
-                "(attempt %d): %s",
-                attempt + 1,
+                "Startup schema setup lost a race, retrying: %s",
                 exc,
             )
             time.sleep(0.5)
@@ -446,9 +432,6 @@ def _run_startup_schema_setup():
 
 with app.app_context():
     if db.engine.dialect.name == "sqlite":
-        # SQLite serialises writers, so concurrent workers raise "database is
-        # locked" under load. This is a mitigation, not a fix — use PostgreSQL for
-        # real multi-worker deployment (see docs.md).
         event.listen(db.engine, "connect", _configure_sqlite_concurrency)
         _enable_sqlite_wal()
     _run_startup_schema_setup()
@@ -477,9 +460,6 @@ def index():
 
 @app.route("/api/health")
 def api_health():
-    # Per-worker diagnostics: under gunicorn each worker is a separate process with
-    # its own WS clients and its own Redis subscriber, so this is how a fan-out
-    # misconfiguration becomes visible instead of silent.
     with app.ws_clients_lock:
         ws_clients = len(app.ws_clients)
 

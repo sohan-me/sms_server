@@ -1,25 +1,15 @@
-# Gunicorn config for the OrbitalCore SMS/OTP server.
-#
-# worker_class must NOT be the default "sync": a sync worker handles one request
-# at a time, so a single long-lived WebSocket connection blocks that worker
-# indefinitely and every other client sharing it stalls. "gthread" keeps the
-# existing threaded Flask code path working without an async rewrite.
-#
-# Do NOT set preload_app = True. app.py opens the OTP Redis subscriber at import
-# time; forking workers would inherit a dead socket and no worker would receive
-# fan-out messages.
-
+# "gthread" is required: the default "sync" worker handles one request at a
+# time, so an open WebSocket blocks the whole worker.
+# Never set preload_app = True — app.py opens the Redis subscriber at import.
 import multiprocessing
 import os
 
-
-bind = os.environ.get("BIND", "0.0.0.0:5000")
+bind = os.environ.get("BIND", "0.0.0.0:8002")
 workers = int(os.environ.get("WEB_CONCURRENCY", max(2, multiprocessing.cpu_count())))
 worker_class = "gthread"
 threads = int(os.environ.get("WEB_THREADS", 8))
 
-# WebSocket connections are long-lived and mostly idle; the default 30s timeout
-# would kill them.
+# WebSockets are long-lived and idle; the 30s default would kill them.
 timeout = int(os.environ.get("WEB_TIMEOUT", 120))
 graceful_timeout = 30
 keepalive = 5
