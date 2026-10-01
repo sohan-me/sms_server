@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import threading
@@ -17,7 +18,8 @@ from flask import (
     url_for,
 )
 from flask_sock import Sock
-from sqlalchemy import inspect, or_, text
+from sqlalchemy import event, inspect, or_, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from otp_broker import OTPBroker
 from models import (
@@ -285,7 +287,18 @@ otp_broker = OTPBroker(
     on_message=_broadcast_otp,
 )
 # Start Redis subscriber at boot so this worker is ready before any WS client connects.
-otp_broker.start()
+if not otp_broker.distributed:
+    logging.getLogger(__name__).warning(
+        "REDIS_URL is not set — OTP delivery is LOCAL-ONLY on this worker. "
+        "WebSocket clients connected to this process will not receive OTPs "
+        "ingested by other workers. Set REDIS_URL for every gunicorn worker."
+    )
+elif not otp_broker.start():
+    logging.getLogger(__name__).error(
+        "OTP Redis subscriber failed to start on this worker — OTP delivery is "
+        "LOCAL-ONLY until Redis is reachable. Check REDIS_URL and that redis-server "
+        "is running and accepting connections."
+    )
 
 
 def _drop_user_ws(user_id):
@@ -374,15 +387,71 @@ def _serve_ws_connection(ws, user_id):
                 app.ws_clients.pop(connection_id, None)
 
 
+def _configure_sqlite_concurrency(dbapi_connection, _record):
+    # busy_timeout is per-connection, so it must be re-applied to every new
+    # connection. Concurrent workers otherwise raise "database is locked"
+    # immediately instead of waiting for the writer to finish.
+    dbapi_connection.execute("PRAGMA busy_timeout=5000")
+
+
+def _enable_sqlite_wal():
+    """Set WAL once, on its own autocommit connection.
+
+    WAL is a persistent property of the database file, and the PRAGMA cannot run
+    inside a transaction — so it must happen outside the schema setup savepoint.
+    """
+    raw = db.engine.raw_connection()
+    try:
+        raw.connection.execute("PRAGMA journal_mode=WAL")
+    finally:
+        raw.close()
+
+
+def _run_startup_schema_setup():
+    """Idempotent boot-time setup, safe when every gunicorn worker runs it at once.
+
+    Each worker executes this concurrently, so a check-then-insert would race:
+    all workers see an empty table and all INSERT, and the UNIQUE violation kills
+    the worker (which takes the whole app down with it). Wrapping in a savepoint
+    makes the loser roll back and carry on.
+    """
+    for attempt in range(5):
+        try:
+            with db.session.begin_nested():
+                db.create_all()
+                ensure_schema_columns()
+                backfill_missing_ws_tokens()
+                if not AdminUser.query.filter_by(username="incomplete").first():
+                    admin = AdminUser(username="incomplete")
+                    admin.set_password(os.environ.get("ADMIN_PASSWORD", "Barhatta&2026"))
+                    db.session.add(admin)
+            db.session.commit()
+            return
+        except (IntegrityError, OperationalError) as exc:
+            db.session.rollback()
+            if attempt == 4:
+                logging.getLogger(__name__).exception(
+                    "Startup schema setup failed after 5 attempts; this worker "
+                    "cannot serve requests reliably"
+                )
+                raise
+            logging.getLogger(__name__).info(
+                "Startup schema setup lost a race with another worker, retrying "
+                "(attempt %d): %s",
+                attempt + 1,
+                exc,
+            )
+            time.sleep(0.5)
+
+
 with app.app_context():
-    db.create_all()
-    ensure_schema_columns()
-    backfill_missing_ws_tokens()
-    if not AdminUser.query.filter_by(username="incomplete").first():
-        admin = AdminUser(username="incomplete")
-        admin.set_password(os.environ.get("ADMIN_PASSWORD", "Barhatta&2026"))
-        db.session.add(admin)
-        db.session.commit()
+    if db.engine.dialect.name == "sqlite":
+        # SQLite serialises writers, so concurrent workers raise "database is
+        # locked" under load. This is a mitigation, not a fix — use PostgreSQL for
+        # real multi-worker deployment (see docs.md).
+        event.listen(db.engine, "connect", _configure_sqlite_concurrency)
+        _enable_sqlite_wal()
+    _run_startup_schema_setup()
 
 
 def requires_admin_auth(f):
@@ -408,7 +477,25 @@ def index():
 
 @app.route("/api/health")
 def api_health():
-    return jsonify({"service": "sms"}), 200
+    # Per-worker diagnostics: under gunicorn each worker is a separate process with
+    # its own WS clients and its own Redis subscriber, so this is how a fan-out
+    # misconfiguration becomes visible instead of silent.
+    with app.ws_clients_lock:
+        ws_clients = len(app.ws_clients)
+
+    return (
+        jsonify(
+            {
+                "service": "sms",
+                "pid": os.getpid(),
+                "redis_configured": otp_broker.distributed,
+                "redis_subscriber_alive": otp_broker.subscriber_alive,
+                "ws_clients": ws_clients,
+                "database": app.config["SQLALCHEMY_DATABASE_URI"].split("://", 1)[0],
+            }
+        ),
+        200,
+    )
 
 
 # ── Device register / authenticate ─────────────────────────────

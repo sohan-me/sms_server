@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(env)",
+      "Shell(grep:*)",
+      "Shell(ps:*)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

@@ -26,6 +26,14 @@ class OTPBroker:
     def distributed(self):
         return bool(self.redis_url)
 
+    @property
+    def subscriber_alive(self):
+        """True when this worker is listening on the OTP channel."""
+        if not self.distributed:
+            return False
+        thread = self._thread
+        return bool(thread and thread.is_alive())
+
     def start(self):
         if not self.distributed:
             return True

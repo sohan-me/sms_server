@@ -4,6 +4,7 @@ Flask==3.0.3
 flask-sock==0.7.0
 Flask-SQLAlchemy==3.1.1
 greenlet==3.3.2
+gunicorn==23.0.0
 h11==0.16.0
 itsdangerous==2.2.0
 Jinja2==3.1.6
@@ -14,3 +15,6 @@ SQLAlchemy==2.0.48
 typing_extensions==4.15.0
 Werkzeug==3.0.3
 wsproto==1.3.2
+
+# Optional: only needed when DATABASE_URL points at PostgreSQL instead of SQLite.
+# psycopg2-binary==2.9.10
