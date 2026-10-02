@@ -1,3 +1,4 @@
+# ── Flask app (legacy, port 8002) ───────────────────────────────
 blinker==1.9.0
 click==8.3.1
 Flask==3.0.3
@@ -16,5 +17,14 @@ typing_extensions==4.15.0
 Werkzeug==3.0.3
 wsproto==1.3.2
 
-# Optional: only needed when DATABASE_URL points at PostgreSQL instead of SQLite.
+# ── FastAPI service (fastapi_app/, port 3002) ───────────────────
+# itsdangerous, Jinja2, MarkupSafe and redis are shared with the Flask app above.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+tortoise-orm==0.25.1
+# Tortoise 0.25 calls Connection.start(), removed in aiosqlite 0.22+.
+aiosqlite==0.21.0
+python-multipart==0.0.32
+
+# PostgreSQL driver for both stacks. Uncomment when DATABASE_URL uses Postgres.
 # psycopg2-binary==2.9.10

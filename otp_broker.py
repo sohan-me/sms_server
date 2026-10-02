@@ -100,6 +100,19 @@ class OTPBroker:
             pass
         self._pubsub = None
 
+    def stop(self):
+        """Signal the listener thread to exit and release the Redis sockets."""
+        self._stop = True
+        with self._lock:
+            self._close_pubsub_locked()
+            client = self._client
+            self._client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def publish(self, payload):
         # Always deliver to local WS clients first (same-worker live push).
         try:

@@ -70,6 +70,58 @@ Use `phone` to identify which number received the OTP.
 - Recover missed OTPs with `GET /api/messages/<phone>`.
 - Multi-worker servers must use the same `REDIS_URL`.
 
+## The two services
+
+| | Path | Port | Stack |
+|---|---|---|---|
+| Flask (legacy) | `app.py` | 8002 | Flask + gunicorn (`gthread`) |
+| FastAPI (current) | `fastapi_app/main.py` | 3002 | FastAPI + Uvicorn + Tortoise |
+
+They serve an identical client-facing contract, so you can run both during a cutover.
+Both import `otp_core.py` and `otp_broker.py` from the server root — that shared code
+is what guarantees identical phone normalisation, OTP extraction and fan-out.
+
+Start the FastAPI service:
+
+```bash
+venv/bin/python -m pip install -r requirements.txt
+pm2 start fastapi_app/ecosystem.config.js
+pm2 save
+```
+
+Set `SECRET_KEY` and `DATABASE_URL` in that config first, and keep `SECRET_KEY`
+identical to the Flask app's or admin sessions break across the cutover.
+
+Verify:
+
+```bash
+curl -s localhost:3002/api/health; echo
+```
+
+`redis_subscriber_alive` must be `true`. With `--workers 1` delivery is local-only by
+nature; add `REDIS_URL` and raise `--workers` before running more than one process.
+
+### Contract conformance
+
+`fastapi_app/test_contract.py` asserts the exact status codes, error strings, response
+key sets, WebSocket frames and close codes the clients depend on — 37 cases. It is the
+gate that makes "no client changes" verifiable rather than aspirational.
+
+```bash
+venv/bin/python -m unittest fastapi_app.test_contract
+```
+
+### Admin: OTP delivery log
+
+`GET /admin/otps` lists which user received which OTP, over which channel, within the
+retention window. Backed by a new `otp_delivery` table written when a frame is handed
+to the socket — so it records *sent*, not *read*.
+
+### Known dependency pins
+
+- `aiosqlite==0.21.0` — Tortoise 0.25 calls `Connection.start()`, removed in 0.22+.
+- `tortoise-orm==0.25.x` — 1.x replaced the global API with a context object.
+
 ## How an OTP reaches a client
 
 1. `POST /api/messages` stores the message and normalizes the OTP to digits.

@@ -18,10 +18,11 @@ from flask import (
     url_for,
 )
 from flask_sock import Sock
-from sqlalchemy import event, inspect, or_, text
+from sqlalchemy import event, func, inspect, or_, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from otp_broker import OTPBroker
+from otp_core import match_signatures
 from models import (
     DEFAULT_MESSAGE_PUB,
     AdminUser,
@@ -61,7 +62,12 @@ def _otp_retention_minutes():
 def _norm_sig(value):
     if value is None:
         return ""
-    return str(value).strip()
+    # Fingerprints are retyped by hand in the admin panel and re-reported by
+    # each PC, so the same identifier arrives with different casing depending
+    # on who typed it. Matching was byte-exact, so a lowercase MAC or an
+    # uppercase GUID failed to match the stored value and an already-registered
+    # device was rejected with "Device not found". Compare case-insensitively.
+    return str(value).strip().upper()
 
 
 def _normalize_device_signatures(data):
@@ -81,29 +87,18 @@ def _find_user_by_signatures(mac, mb, guid, bios):
         "bios_serial": bios,
     }
     provided = {name: value for name, value in provided.items() if value}
+    # norm_sig() upper-cases, so the prefilter must compare case-insensitively
+    # too — a byte-exact SQL filter would never return a device stored with
+    # different casing, and the device would look unregistered.
     clauses = [
-        getattr(DeviceUser, name) == value
+        func.upper(getattr(DeviceUser, name)) == value
         for name, value in provided.items()
     ]
     if len(clauses) < MIN_SIGNATURE_FIELDS:
         return None, "insufficient"
 
     candidates = DeviceUser.query.filter(or_(*clauses)).all()
-    matches = [
-        user
-        for user in candidates
-        if sum(
-            1
-            for name, value in provided.items()
-            if getattr(user, name) == value
-        )
-        >= MIN_SIGNATURE_FIELDS
-    ]
-    if len(matches) == 1:
-        return matches[0], None
-    if len(matches) > 1:
-        return None, "ambiguous"
-    return None, "not_found"
+    return match_signatures(candidates, mac, mb, guid, bios)
 
 
 def normalize_bd_phone(value):
@@ -275,6 +270,13 @@ def _broadcast_otp(payload: dict):
             client_data["ws"].send(ws_msg)
         except Exception:
             dead.append((connection_id, client_data["ws"]))
+            logging.getLogger(__name__).warning(
+                "WS send failed for phone %s on connection %s (user %s)",
+                phone,
+                connection_id,
+                client_data["user_id"],
+                exc_info=True,
+            )
 
     with app.ws_clients_lock:
         for connection_id, client in dead:
@@ -626,6 +628,7 @@ def api_get_messages(phone):
 
     # Only return normalized digit OTPs (drops junk like "test-no-pub")
     msg_list = []
+    delivered = []
     for m in messages:
         digits = _extract_normalized_otp(m.otp_message)
         if not digits:
@@ -638,10 +641,13 @@ def api_get_messages(phone):
                 "used": bool(m.is_used),
             }
         )
+        delivered.append(m)
 
-    for m in messages:
+    # Only rows actually returned are consumed. Marking every matched row used
+    # would let one poller consume an OTP that another client still needs.
+    for m in delivered:
         m.is_used = True
-    if messages:
+    if delivered:
         db.session.commit()
 
     return jsonify(msg_list), 200
