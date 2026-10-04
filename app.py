@@ -785,10 +785,10 @@ def api_get_messages(phone):
             continue
         msg_list.append(
             {
-                "otp": digits,
+                "checkedAt": _format_bdt(m.created_at),
+                "count": len(msg_list) + 1,
+                "message": digits,
                 "used": bool(m.is_used),
-                "id": m.id,
-                "created_at": _format_bdt(m.created_at),
             }
         )
         delivered.append(m)
@@ -800,13 +800,7 @@ def api_get_messages(phone):
     if delivered:
         db.session.commit()
 
-    return jsonify(
-        {
-            "count": len(msg_list),
-            "messages": msg_list,
-            "checkedAt": _format_bdt(),
-        }
-    ), 200
+    return jsonify(msg_list), 200
 
 
 # ── WebSocket ──────────────────────────────────────────────────
