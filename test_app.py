@@ -209,22 +209,20 @@ class OTPServerTests(unittest.TestCase):
         self.assertEqual(peak["now"], 1, "writes to one socket overlapped")
         self.assertEqual(len(ws.sent), 12)
 
-    def test_http_uses_each_message_creation_time_for_checked_at(self):
+    def test_http_returns_the_documented_envelope_with_top_level_used(self):
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        first_time = now - timedelta(minutes=2)
-        second_time = now - timedelta(minutes=1)
         with app.app_context():
             db.session.add_all(
                 [
                     OTPMessage(
                         phone="01712345678",
                         otp_message="111111",
-                        created_at=first_time,
+                        created_at=now - timedelta(minutes=2),
                     ),
                     OTPMessage(
                         phone="01712345678",
                         otp_message="222222",
-                        created_at=second_time,
+                        created_at=now - timedelta(minutes=1),
                     ),
                 ]
             )
@@ -234,11 +232,75 @@ class OTPServerTests(unittest.TestCase):
         payload = response.get_json()
 
         self.assertEqual(response.status_code, 200)
+
+        # The envelope is exactly these three keys and no others.
         self.assertEqual(
-            [item["checkedAt"] for item in payload],
-            [_format_bdt(first_time), _format_bdt(second_time)],
+            sorted(payload.keys()), ["checkedAt", "count", "messages"]
         )
-        self.assertNotEqual(payload[0]["checkedAt"], payload[1]["checkedAt"])
+
+        # `count` is how many OTPs this poll returned, so it tracks the list.
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["count"], len(payload["messages"]))
+        self.assertTrue(payload["checkedAt"])
+
+        # Every code is its own object carrying {otp, used, id, created_at}, so
+        # a bot can tell them apart and tell which is newest.
+        self.assertEqual(len(payload["messages"]), 2)
+        for item in payload["messages"]:
+            self.assertIsInstance(item, dict)
+            self.assertEqual(
+                sorted(item), ["created_at", "id", "otp", "used"]
+            )
+
+        codes = [item["otp"] for item in payload["messages"]]
+        self.assertEqual(codes, ["111111", "222222"])
+
+        # Each item carries its own creation time, and they differ, so ordering
+        # is unambiguous without any extra field.
+        times = [item["created_at"] for item in payload["messages"]]
+        self.assertEqual(len(set(times)), 2)
+        self.assertEqual(times, sorted(times))
+        ids = [item["id"] for item in payload["messages"]]
+        self.assertEqual(ids, sorted(ids))
+
+    def test_http_reports_each_otp_as_its_own_object(self):
+        """One OTP -> count 1; three OTPs -> count 3, never a shared shape."""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        with app.app_context():
+            for i in range(3):
+                db.session.add(
+                    OTPMessage(
+                        phone="01712345679",
+                        otp_message="10000%d" % i,
+                        created_at=now - timedelta(minutes=3 - i),
+                    )
+                )
+            db.session.commit()
+
+        payload = app.test_client().get("/api/messages/01712345679").get_json()
+
+        self.assertEqual(payload["count"], 3)
+        self.assertEqual(
+            [item["otp"] for item in payload["messages"]],
+            ["100000", "100001", "100002"],
+        )
+        # No shared/duplicated envelope: each OTP is one distinct object.
+        self.assertEqual(
+            len({item["id"] for item in payload["messages"]}), 3
+        )
+        for item in payload["messages"]:
+            self.assertEqual(
+                sorted(item), ["created_at", "id", "otp", "used"]
+            )
+
+    def test_http_returns_an_empty_list_when_nothing_matches(self):
+        response = app.test_client().get("/api/messages/01700000000")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["messages"], [])
+        self.assertTrue(payload["checkedAt"])
 
     def test_authentication_accepts_any_two_matching_fingerprint_fields(self):
         with app.app_context():
