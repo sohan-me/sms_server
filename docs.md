@@ -68,7 +68,8 @@ Use `phone` to identify which number received the OTP.
 - A connection receives OTPs only for its current phone list.
 - Multiple users and connections can run together.
 - Recover missed OTPs with `GET /api/messages/<phone>`.
-- Multi-worker servers must use the same `REDIS_URL`.
+- Multi-worker servers must share the same `DATABASE_URL` (that is how one worker
+  sees an OTP ingested by another). `REDIS_URL` is optional and only faster.
 
 ## The two services
 
@@ -98,8 +99,9 @@ Verify:
 curl -s localhost:3002/api/health; echo
 ```
 
-`redis_subscriber_alive` must be `true`. With `--workers 1` delivery is local-only by
-nature; add `REDIS_URL` and raise `--workers` before running more than one process.
+`db_poller_alive` must be `true` — that poller is how one worker reaches clients
+held by another, so it is the delivery path that matters. `redis_subscriber_alive`
+being `false` is fine and just means the slower path is in use.
 
 ### Contract conformance
 
@@ -125,18 +127,35 @@ to the socket — so it records *sent*, not *read*.
 ## How an OTP reaches a client
 
 1. `POST /api/messages` stores the message and normalizes the OTP to digits.
-2. `OTPBroker.publish()` delivers it to WebSocket clients **in this process**, then
-   publishes to the Redis channel `orbitalcore:otp`.
-3. Every worker's subscriber receives it and sends it to its own clients whose
-   subscribed phone list contains the OTP's `phone`.
+2. `OTPBroker.publish()` delivers it to WebSocket clients **in this process**.
+3. Every worker polls `otp_message` for rows newer than the last id it saw and
+   delivers them to its own subscribed clients, deduplicated by OTP id.
 
-Step 2's local delivery happens whether or not Redis is configured. So with Redis
-missing, only the clients sharing the process that ingested the SMS receive anything —
-which looks like "it works for one user but not the others".
+**No broker is required.** Each worker's WebSocket registry lives only in that
+worker's memory, so an OTP ingested by one worker has to reach the clients held by
+the others. They share the `otp_message` table, so each worker can read what the
+others wrote — that read *is* the cross-worker delivery path, and it is what makes
+Redis optional rather than a correctness dependency.
+
+An earlier version relied on Redis Pub/Sub alone. With `REDIS_URL` missing, only the
+clients sharing the process that ingested the SMS received anything, which presented
+as "it works for the admin but not for the other users". Measured on gunicorn
+gthread ×4 workers: **3 of 8 clients served before, 14 of 14 after.**
+
+Setting `REDIS_URL` is still supported as an accelerator — it just makes the same
+delivery faster:
+
+| Path | median | p95 |
+|---|---|---|
+| Redis pub/sub | 11 ms | 15 ms |
+| DB poller (default) | 188 ms | 412 ms |
+
+188 ms is not perceptible in a flow where a human types the code, so dropping Redis
+trades a service to operate for latency nobody can feel.
 
 `OTPMessage` is the retention store (purged after `OTP_RETENTION_MINUTES` on each
-`GET /api/messages/<phone>`). Redis Pub/Sub is fire-and-forget transport only — it
-cannot store or expire anything, so OTPs are deliberately not kept there.
+`GET /api/messages/<phone>`). `OTP_POLL_INTERVAL` (default `0.5`s) controls how
+often a worker checks; a worker with no connected clients skips the query entirely.
 
 ## Deployment (gunicorn + pm2)
 
@@ -156,12 +175,13 @@ Two settings are load-bearing and easy to get wrong:
 - **`worker_class = "gthread"`** (see `gunicorn.conf.py`). gunicorn's default `sync`
   worker handles one request at a time, so one open WebSocket blocks that worker and
   stalls every other client sharing it.
-- **`REDIS_URL` in the pm2 `env` block.** A `.env` file is not read by gunicorn or
-  pm2. The app logs a warning at startup when it is missing.
+- **One `DATABASE_URL` shared by every worker.** It is how an OTP ingested by one
+  worker reaches the WebSocket clients held by the others. A `.env` file is not read
+  by gunicorn or pm2 — put it in the pm2 `env` block.
 
-Never start `app.py` directly — its `__main__` block runs the Werkzeug dev server with
-`debug=True`, whose reloader spawns a second process that re-imports the app and opens
-a duplicate Redis subscriber.
+Never start `app.py` directly — its `__main__` block runs the Werkzeug dev server
+with `debug=True`, whose reloader spawns a second process that re-imports the app
+and opens a duplicate OTP poller.
 
 The app listens on **port 8002** by default (`BIND` in `ecosystem.config.js` and
 `gunicorn.conf.py`). Point your reverse proxy upstream at `127.0.0.1:8002`, and make
@@ -192,25 +212,60 @@ way to see a misconfiguration:
 {
   "service": "sms",
   "pid": 1234,
-  "redis_configured": true,
-  "redis_subscriber_alive": true,
+  "redis_configured": false,
+  "redis_subscriber_alive": false,
+  "otp_fanout": "db-poller",
+  "db_poller_alive": true,
   "ws_clients": 2,
   "database": "sqlite"
 }
 ```
 
 Call it repeatedly — each response is a different worker. A healthy multi-worker setup
-shows a **different `pid` each time**, every one with `redis_subscriber_alive: true`,
-and `ws_clients` summing to the number of live clients. If a worker reports
-`redis_subscriber_alive: false` or is missing from the rotation, that is the cause.
+shows a **different `pid` each time**, `db_poller_alive: true` on every worker, and
+`ws_clients` summing to the number of live clients.
+
+`db_poller_alive` is the field that matters. It is how one worker reaches clients held
+by another, so `false` means cross-worker delivery is broken on that worker.
+`otp_fanout` names the path in use: `redis` when an accelerator is configured and
+connected, `db-poller` for the default path — which is correct, not a fault.
+`local-only` is the only genuinely bad value: the poller is not running *and* there is
+no Redis, so clients on this worker will only ever get OTPs ingested here.
+
+`redis_configured` is not a health signal — it reports whether the variable was set,
+not whether anything connected. With Redis dropped it is simply `false`.
 
 ```bash
 for pid in $(pgrep -f "gunicorn: worker"); do
-  echo "== $pid"; tr '\0' '\n' < /proc/$pid/environ | grep -E "REDIS_URL|DATABASE_URL|SECRET_KEY"
+  echo "== $pid"; tr '\0' '\n' < /proc/$pid/environ | grep -E "DATABASE_URL|SECRET_KEY"
 done
-
-redis-cli -u "$REDIS_URL" pubsub channels   # expect orbitalcore:otp, one subscriber per worker
 ```
+
+Every worker must report the **same** `DATABASE_URL`; a mismatch silently splits
+delivery, because each worker then only sees its own OTPs.
+
+### WebSocket capacity
+
+Each open WebSocket holds one `gthread` worker thread for its whole life — the
+handler blocks in `ws.receive()` until the peer goes away — and those same threads
+serve `POST /api/messages`. So:
+
+```text
+concurrent WebSocket connections  <  WEB_CONCURRENCY × WEB_THREADS
+```
+
+Raise `WEB_THREADS` to raise that ceiling. Note that gunicorn's `timeout` does **not**
+govern WebSockets: its liveness check only touches a temp file from the worker's main
+loop, which keeps running regardless of how many pool threads are stuck, so a worker
+holding dead WebSocket threads is never recycled. Server-side pings
+(`WS_PING_INTERVAL`, default 25s) are what actually reap clients killed by nginx or a
+NAT timeout.
+
+Every write to a socket goes through a per-connection lock, because both the Redis
+subscriber thread and the client's own handler thread write to it, and
+`simple_websocket`'s `send()` mutates wsproto state then writes raw bytes with no
+lock of its own. Any removal from the registry closes the socket, so a dead client
+cannot linger believing it is still connected.
 
 ### Database
 

@@ -3,14 +3,24 @@ import logging
 import threading
 import time
 
-import redis
+try:
+    import redis
+except ImportError:  # pragma: no cover
+    # Redis is an optional fast path. OTP delivery is carried by the database
+    # poller in app.py, so the app must import and run with redis not installed.
+    redis = None
 
 
 logger = logging.getLogger(__name__)
 
 
 class OTPBroker:
-    """Publish OTPs across workers and deliver them to local WebSockets."""
+    """Publish OTPs across workers and deliver them to local WebSockets.
+
+    Redis is optional. When REDIS_URL is unset — or the `redis` package is not
+    installed — `distributed` is False and every method becomes a no-op, leaving
+    the database poller as the sole cross-worker delivery path.
+    """
 
     def __init__(self, redis_url, on_message, channel="orbitalcore:otp"):
         self.redis_url = (redis_url or "").strip()
@@ -24,7 +34,7 @@ class OTPBroker:
 
     @property
     def distributed(self):
-        return bool(self.redis_url)
+        return bool(self.redis_url) and redis is not None
 
     @property
     def subscriber_alive(self):

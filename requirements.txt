@@ -10,15 +10,19 @@ h11==0.16.0
 itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.3
-redis==5.2.1
 simple-websocket==1.1.0
 SQLAlchemy==2.0.48
 typing_extensions==4.15.0
 Werkzeug==3.0.3
 wsproto==1.3.2
 
+# Optional: set REDIS_URL to make cross-worker OTP delivery ~180ms faster.
+# Not required — without it the database poller carries every OTP, and the app
+# runs fine with this package absent.
+# redis==5.2.1
+
 # ── FastAPI service (fastapi_app/, port 3002) ───────────────────
-# itsdangerous, Jinja2, MarkupSafe and redis are shared with the Flask app above.
+# itsdangerous, Jinja2, MarkupSafe and redis (optional) are shared with the Flask app above.
 fastapi==0.142.2
 uvicorn[standard]==0.54.0
 tortoise-orm==0.25.1

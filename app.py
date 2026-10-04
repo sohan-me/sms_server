@@ -45,7 +45,13 @@ app.config["WS_AUTH_TOKEN"] = os.environ.get("WS_AUTH_TOKEN", "").strip() or Non
 
 db.init_app(app)
 sock = Sock(app)
-app.ws_clients = {}  # connection_id -> {ws, user_id, phones}
+# Without a ping interval simple_websocket never probes an idle peer, so a client
+# killed by nginx or a NAT timeout is never detected: it stays in app.ws_clients and
+# its gthread slot stays blocked forever. Pinging makes it get closed and reaped.
+app.config["SOCK_SERVER_OPTIONS"] = {
+    "ping_interval": int(os.environ.get("WS_PING_INTERVAL", "25"))
+}
+app.ws_clients = {}  # connection_id -> {ws, user_id, phones, send_lock}
 app.ws_clients_lock = threading.RLock()
 
 MIN_SIGNATURE_FIELDS = 2
@@ -239,6 +245,29 @@ def backfill_missing_ws_tokens():
     db.session.commit()
 
 
+def _unregister_ws(connection_id, expected_ws=None, close_reason=1000, close_message="Connection closed"):
+    """Remove a client from the registry and close its socket.
+
+    Every removal must go through here. Popping the entry while leaving the socket
+    open leaves the handler thread blocked in ws.receive() and the peer believing it
+    is still connected, so the OTP simply never arrives again for that client.
+    """
+    with app.ws_clients_lock:
+        client_data = app.ws_clients.get(connection_id)
+        if client_data is None:
+            return None
+        if expected_ws is not None and client_data["ws"] is not expected_ws:
+            return None
+        app.ws_clients.pop(connection_id, None)
+
+    ws = client_data["ws"]
+    try:
+        ws.close(close_reason, close_message)
+    except Exception:
+        pass
+    return client_data
+
+
 def _broadcast_otp(payload: dict):
     # Deduplicate local+Redis echo of the same OTP id on one worker.
     msg_id = payload.get("id")
@@ -262,12 +291,20 @@ def _broadcast_otp(payload: dict):
     with app.ws_clients_lock:
         clients = list(app.ws_clients.items())
 
+    delivered = 0
     dead = []
     for connection_id, client_data in clients:
         if phone not in client_data["phones"]:
             continue
         try:
-            client_data["ws"].send(ws_msg)
+            # The Redis subscriber thread and this client's handler thread both
+            # write to the same socket, and simple_websocket's send() mutates
+            # wsproto state then writes raw bytes with no lock of its own.
+            # Without this, two writers interleave and the peer's frame parser
+            # desyncs, silently discarding every later message.
+            with client_data["send_lock"]:
+                client_data["ws"].send(ws_msg)
+            delivered += 1
         except Exception:
             dead.append((connection_id, client_data["ws"]))
             logging.getLogger(__name__).warning(
@@ -278,46 +315,133 @@ def _broadcast_otp(payload: dict):
                 exc_info=True,
             )
 
-    with app.ws_clients_lock:
-        for connection_id, client in dead:
-            current = app.ws_clients.get(connection_id)
-            if current and current["ws"] is client:
-                app.ws_clients.pop(connection_id, None)
+    if delivered == 0:
+        logging.getLogger(__name__).info(
+            "OTP %s for phone %s matched no WebSocket subscription on this "
+            "worker (id=%s); %d client(s) connected here",
+            payload.get("otp"),
+            phone,
+            msg_id,
+            len(clients),
+        )
+
+    for connection_id, client in dead:
+        _unregister_ws(connection_id, expected_ws=client, close_reason=1011)
+
+
+def _poll_otps_from_db(stop_event, interval=0.5):
+    """Deliver OTPs that this worker never saw directly, by polling the shared table.
+
+    This is the cross-worker delivery path. Every OTP is already a row in
+    `otp_message`, which every worker shares, so a worker can always deliver OTPs
+    another worker ingested — no broker required.
+
+    Deduplicated against the same `_otp_broadcast_seen` map the broker path uses, so
+    a client subscribed on several workers still receives each OTP exactly once.
+
+    A worker with no WebSocket clients has nobody to deliver to, so it skips the
+    query entirely. With Redis removed this poller is the only delivery path, so
+    keeping idle workers quiet keeps database load proportional to how many bots
+    are actually connected.
+    """
+    last_seen_id = 0
+    with app.app_context():
+        try:
+            last_seen_id = db.session.query(
+                func.max(OTPMessage.id)
+            ).scalar() or 0
+        except Exception:
+            # The schema is created further down at import time, so on a cold boot
+            # the table may not exist yet. Start from 0 and re-check on each pass.
+            db.session.rollback()
+            last_seen_id = 0
+
+        while not stop_event.is_set():
+            with app.ws_clients_lock:
+                has_clients = bool(app.ws_clients)
+
+            if not has_clients:
+                stop_event.wait(interval)
+                continue
+
+            try:
+                rows = (
+                    db.session.query(OTPMessage)
+                    .filter(OTPMessage.id > last_seen_id)
+                    .order_by(OTPMessage.id.asc())
+                    .limit(500)
+                    .all()
+                )
+                for row in rows:
+                    last_seen_id = row.id
+                    digits = _extract_normalized_otp(row.otp_message)
+                    if not digits:
+                        continue
+                    _broadcast_otp(
+                        {
+                            "id": row.id,
+                            "otp": digits,
+                            "phone": row.phone,
+                            "used": bool(row.is_used),
+                            "created_at": _format_bdt(row.created_at),
+                        }
+                    )
+                if rows:
+                    db.session.remove()
+            except Exception:
+                db.session.remove()
+                logging.getLogger(__name__).exception(
+                    "OTP database poller hit an error; retrying"
+                )
+
+            stop_event.wait(interval)
+
+
+def _start_db_poller():
+    if os.environ.get("DISABLE_DB_OTP_POLLER"):
+        return None
+    interval = max(0.05, float(os.environ.get("OTP_POLL_INTERVAL", "0.5")))
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_poll_otps_from_db,
+        args=(stop_event, interval),
+        name="otp-db-poller",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
 
 otp_broker = OTPBroker(
     redis_url=os.environ.get("REDIS_URL"),
     on_message=_broadcast_otp,
 )
-# Start Redis subscriber at boot so this worker is ready before any WS client connects.
+# Redis is an optional accelerator. Without it the database poller below carries
+# delivery on its own, so nothing here is a failure state.
 if not otp_broker.distributed:
-    logging.getLogger(__name__).warning(
-        "REDIS_URL is not set — OTP delivery is LOCAL-ONLY on this worker. "
-        "WebSocket clients connected to this process will not receive OTPs "
-        "ingested by other workers. Set REDIS_URL for every gunicorn worker."
+    logging.getLogger(__name__).info(
+        "OTP delivery on this worker runs through the database poller "
+        "(no usable REDIS_URL). Cross-worker delivery does not require Redis; "
+        "setting REDIS_URL only makes it faster."
     )
 elif not otp_broker.start():
     logging.getLogger(__name__).error(
-        "OTP Redis subscriber failed to start on this worker — OTP delivery is "
-        "LOCAL-ONLY until Redis is reachable. Check REDIS_URL and that redis-server "
-        "is running and accepting connections."
+        "OTP Redis subscriber failed to start on this worker — falling back to "
+        "the database poller. Check REDIS_URL and that redis-server is running "
+        "and accepting connections."
     )
 
 
 def _drop_user_ws(user_id):
     with app.ws_clients_lock:
-        clients = [
-            (connection_id, client_data["ws"])
+        connection_ids = [
+            connection_id
             for connection_id, client_data in app.ws_clients.items()
             if client_data["user_id"] == user_id
         ]
-        for connection_id, _ in clients:
-            app.ws_clients.pop(connection_id, None)
 
-    for _, client in clients:
-        try:
-            client.close(4003, "Access revoked")
-        except Exception:
-            pass
+    for connection_id in connection_ids:
+        _unregister_ws(connection_id, close_reason=4003, close_message="Access revoked")
 
 
 def _parse_subscription(raw_message):
@@ -353,6 +477,7 @@ def _serve_ws_connection(ws, user_id):
             "ws": ws,
             "user_id": user_id,
             "phones": set(),
+            "send_lock": threading.Lock(),
         }
 
     try:
@@ -372,21 +497,24 @@ def _serve_ws_connection(ws, user_id):
                     break
                 client_data["phones"] = phones
 
-            ws.send(
-                json.dumps(
-                    {
-                        "type": "subscribed",
-                        "phones": sorted(phones),
-                    }
+            with client_data["send_lock"]:
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "subscribed",
+                            "phones": sorted(phones),
+                        }
+                    )
                 )
-            )
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "WS receive loop ended for connection %s (user %s)",
+            connection_id,
+            user_id,
+            exc_info=True,
+        )
     finally:
-        with app.ws_clients_lock:
-            client_data = app.ws_clients.get(connection_id)
-            if client_data and client_data["ws"] is ws:
-                app.ws_clients.pop(connection_id, None)
+        _unregister_ws(connection_id, expected_ws=ws)
 
 
 def _configure_sqlite_concurrency(dbapi_connection, _record):
@@ -438,6 +566,11 @@ with app.app_context():
         _enable_sqlite_wal()
     _run_startup_schema_setup()
 
+# Started only after the schema exists, so the poller never races table creation.
+# The poller is the correctness backstop: it makes delivery independent of Redis,
+# which is what caused OTPs to silently stop reaching clients on other workers.
+app.otp_db_poller = _start_db_poller()
+
 
 def requires_admin_auth(f):
     @wraps(f)
@@ -465,13 +598,30 @@ def api_health():
     with app.ws_clients_lock:
         ws_clients = len(app.ws_clients)
 
+    # "redis_configured" alone used to look healthy on a worker whose Redis
+    # subscriber had died. Report the two separately, plus which delivery path is
+    # actually carrying OTPs, because that is what determines whether a client on
+    # this worker gets its OTP at all.
+    poller_alive = bool(
+        getattr(app, "otp_db_poller", None) and app.otp_db_poller.is_alive()
+    )
+    if otp_broker.subscriber_alive:
+        fanout = "redis"
+    elif poller_alive:
+        fanout = "db-poller"
+    else:
+        fanout = "local-only"
+
     return (
         jsonify(
             {
                 "service": "sms",
                 "pid": os.getpid(),
+                # Redis is an optional accelerator; delivery does not need it.
                 "redis_configured": otp_broker.distributed,
                 "redis_subscriber_alive": otp_broker.subscriber_alive,
+                "otp_fanout": fanout,
+                "db_poller_alive": poller_alive,
                 "ws_clients": ws_clients,
                 "database": app.config["SQLALCHEMY_DATABASE_URI"].split("://", 1)[0],
             }
