@@ -199,8 +199,8 @@ def ensure_schema_columns():
 
     if "otp_message" in tables:
         cols = {c["name"] for c in insp.get_columns("otp_message")}
-        if "message_pub" not in cols:
-            with db.engine.begin() as conn:
+        with db.engine.begin() as conn:
+            if "message_pub" not in cols:
                 conn.execute(
                     text(
                         "ALTER TABLE otp_message ADD COLUMN message_pub VARCHAR(16) DEFAULT 'IVAC'"
@@ -211,6 +211,57 @@ def ensure_schema_columns():
                         "UPDATE otp_message SET message_pub = 'IVAC' WHERE message_pub IS NULL"
                     )
                 )
+
+            # The store keeps one row per phone now: a new OTP overwrites
+            # the existing row. Collapse any history first so the unique
+            # index can be created.
+            conn.execute(
+                text(
+                    "DELETE FROM otp_message WHERE id NOT IN "
+                    "(SELECT MAX(id) FROM otp_message GROUP BY phone)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_otp_message_phone "
+                    "ON otp_message (phone)"
+                )
+            )
+            if "updated_at" not in cols:
+                conn.execute(
+                    text("ALTER TABLE otp_message ADD COLUMN updated_at DATETIME")
+                )
+                conn.execute(
+                    text(
+                        "UPDATE otp_message SET updated_at = created_at "
+                        "WHERE updated_at IS NULL"
+                    )
+                )
+            if "revision" not in cols:
+                conn.execute(
+                    text("ALTER TABLE otp_message ADD COLUMN revision BIGINT")
+                )
+                conn.execute(
+                    text("UPDATE otp_message SET revision = id WHERE revision IS NULL")
+                )
+
+    # The counter must never lag behind the rows it counts, and every
+    # worker boots concurrently, so both statements are idempotent.
+    with db.engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO otp_revision (id, value) "
+                "SELECT 1, COALESCE((SELECT MAX(revision) FROM otp_message), 0) "
+                "WHERE NOT EXISTS (SELECT 1 FROM otp_revision)"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE otp_revision SET value = "
+                "(SELECT COALESCE(MAX(revision), 0) FROM otp_message) "
+                "WHERE value < (SELECT COALESCE(MAX(revision), 0) FROM otp_message)"
+            )
+        )
 
     if "device_user" in tables:
         cols = {c["name"] for c in insp.get_columns("device_user")}
@@ -269,25 +320,26 @@ def _unregister_ws(connection_id, expected_ws=None, close_reason=1000, close_mes
 
 
 def _broadcast_otp(payload: dict):
-    # Deduplicate local+Redis echo of the same OTP id on one worker.
-    msg_id = payload.get("id")
-    if msg_id is not None:
-        key = str(msg_id)
-        now = time.time()
-        with app.ws_clients_lock:
-            seen = getattr(app, "_otp_broadcast_seen", None)
-            if seen is None:
-                seen = {}
-                app._otp_broadcast_seen = seen
-            expired = [k for k, ts in seen.items() if now - ts > 60]
-            for k in expired:
-                seen.pop(k, None)
-            if key in seen:
-                return
-            seen[key] = now
+    # Deduplicate the same arrival reaching this worker twice: the local
+    # publish plus its Redis echo, or the poller re-reading a row this
+    # worker already delivered. A number's row is reused, so the arrival
+    # timestamp is the per-delivery identity.
+    phone = normalize_bd_phone(payload.get("phone"))
+    arrival_key = f"{phone}|{payload.get('last_updated')}"
+    now = time.time()
+    with app.ws_clients_lock:
+        seen = getattr(app, "_otp_broadcast_seen", None)
+        if seen is None:
+            seen = {}
+            app._otp_broadcast_seen = seen
+        expired = [k for k, ts in seen.items() if now - ts > 60]
+        for k in expired:
+            seen.pop(k, None)
+        if arrival_key in seen:
+            return
+        seen[arrival_key] = now
 
     ws_msg = json.dumps(payload)
-    phone = normalize_bd_phone(payload.get("phone"))
     with app.ws_clients_lock:
         clients = list(app.ws_clients.items())
 
@@ -318,10 +370,9 @@ def _broadcast_otp(payload: dict):
     if delivered == 0:
         logging.getLogger(__name__).info(
             "OTP %s for phone %s matched no WebSocket subscription on this "
-            "worker (id=%s); %d client(s) connected here",
+            "worker; %d client(s) connected here",
             payload.get("otp"),
             phone,
-            msg_id,
             len(clients),
         )
 
@@ -329,32 +380,55 @@ def _broadcast_otp(payload: dict):
         _unregister_ws(connection_id, expected_ws=client, close_reason=1011)
 
 
+def _next_otp_revision():
+    """Bump and return the monotonic OTP arrival counter.
+
+    The delivery poller follows this counter instead of `otp_message.id`
+    because a new OTP for a known number updates the existing row — the
+    row id stays the same, so it cannot mark an arrival as seen.
+    """
+    # Seed the single counter row if it is missing (fresh database).
+    db.session.execute(
+        text(
+            "INSERT INTO otp_revision (id, value) VALUES (1, 0) "
+            "ON CONFLICT (id) DO NOTHING"
+        )
+    )
+    db.session.execute(text("UPDATE otp_revision SET value = value + 1 WHERE id = 1"))
+    return db.session.execute(
+        text("SELECT value FROM otp_revision WHERE id = 1")
+    ).scalar()
+
+
 def _poll_otps_from_db(stop_event, interval=0.5):
     """Deliver OTPs that this worker never saw directly, by polling the shared table.
 
-    This is the cross-worker delivery path. Every OTP is already a row in
-    `otp_message`, which every worker shares, so a worker can always deliver OTPs
-    another worker ingested — no broker required.
+    This is the cross-worker delivery path. Every number has one row in
+    `otp_message`, shared by every worker, so a worker can always deliver
+    OTPs another worker ingested — no broker required.
 
-    Deduplicated against the same `_otp_broadcast_seen` map the broker path uses, so
-    a client subscribed on several workers still receives each OTP exactly once.
+    The cursor is the `revision` counter, not the row id: a new OTP for
+    a known number updates the existing row, so the id stays the same and
+    cannot mark an arrival as seen. Deduplicated against the same
+    `_otp_broadcast_seen` map the broker path uses, so a client
+    subscribed on several workers still receives each OTP exactly once.
 
     A worker with no WebSocket clients has nobody to deliver to, so it skips the
     query entirely. With Redis removed this poller is the only delivery path, so
     keeping idle workers quiet keeps database load proportional to how many bots
     are actually connected.
     """
-    last_seen_id = 0
+    last_seen_revision = 0
     with app.app_context():
         try:
-            last_seen_id = db.session.query(
-                func.max(OTPMessage.id)
+            last_seen_revision = db.session.query(
+                func.max(OTPMessage.revision)
             ).scalar() or 0
         except Exception:
             # The schema is created further down at import time, so on a cold boot
             # the table may not exist yet. Start from 0 and re-check on each pass.
             db.session.rollback()
-            last_seen_id = 0
+            last_seen_revision = 0
 
         while not stop_event.is_set():
             with app.ws_clients_lock:
@@ -367,23 +441,21 @@ def _poll_otps_from_db(stop_event, interval=0.5):
             try:
                 rows = (
                     db.session.query(OTPMessage)
-                    .filter(OTPMessage.id > last_seen_id)
-                    .order_by(OTPMessage.id.asc())
+                    .filter(OTPMessage.revision > last_seen_revision)
+                    .order_by(OTPMessage.revision.asc())
                     .limit(500)
                     .all()
                 )
                 for row in rows:
-                    last_seen_id = row.id
+                    last_seen_revision = row.revision
                     digits = _extract_normalized_otp(row.otp_message)
                     if not digits:
                         continue
                     _broadcast_otp(
                         {
-                            "id": row.id,
                             "otp": digits,
                             "phone": row.phone,
-                            "used": bool(row.is_used),
-                            "created_at": _format_bdt(row.created_at),
+                            "last_updated": _format_bdt(row.updated_at),
                         }
                     )
                 if rows:
@@ -735,23 +807,40 @@ def api_add_message():
         return jsonify({"error": "Missing phone or message"}), 400
 
     message = str(message)[:199]
-    new_msg = OTPMessage(
-        phone=phone,
-        otp_message=message,
-        message_pub=DEFAULT_MESSAGE_PUB,
+    # One row per phone: an OTP for a known number overwrites the
+    # previous one instead of appending a second row.
+    now = datetime.utcnow()
+    revision = _next_otp_revision()
+    db.session.execute(
+        text(
+            """
+            INSERT INTO otp_message
+                (phone, otp_message, message_pub, created_at, updated_at, revision)
+            VALUES (:phone, :message, :pub, :now, :now, :revision)
+            ON CONFLICT (phone) DO UPDATE SET
+                otp_message = excluded.otp_message,
+                message_pub = excluded.message_pub,
+                updated_at = excluded.updated_at,
+                revision = excluded.revision
+            """
+        ),
+        {
+            "phone": phone,
+            "message": message,
+            "pub": DEFAULT_MESSAGE_PUB,
+            "now": now,
+            "revision": revision,
+        },
     )
-    db.session.add(new_msg)
     db.session.commit()
 
     otp_digits = _extract_normalized_otp(message)
     if otp_digits:
         otp_broker.publish(
             {
-                "id": new_msg.id,
                 "otp": otp_digits,
-                "phone": new_msg.phone,
-                "used": bool(new_msg.is_used),
-                "created_at": _format_bdt(new_msg.created_at),
+                "phone": phone,
+                "last_updated": _format_bdt(now),
             }
         )
 
@@ -762,45 +851,34 @@ def api_add_message():
 def api_get_messages(phone):
     retention = _otp_retention_minutes()
     expiry_threshold = datetime.utcnow() - timedelta(minutes=retention)
-    OTPMessage.query.filter(OTPMessage.created_at < expiry_threshold).delete()
+    OTPMessage.query.filter(OTPMessage.updated_at < expiry_threshold).delete()
     db.session.commit()
 
     norm = normalize_bd_phone(phone)
     raw_key = str(phone or "").strip()
-    messages = (
+    row = (
         OTPMessage.query.filter(
             or_(OTPMessage.phone == norm, OTPMessage.phone == raw_key),
         )
-        .filter(OTPMessage.created_at >= expiry_threshold)
-        .order_by(OTPMessage.id.asc())
-        .all()
+        .filter(OTPMessage.updated_at >= expiry_threshold)
+        .order_by(OTPMessage.id.desc())
+        .first()
     )
 
-    # Only return normalized digit OTPs (drops junk like "test-no-pub")
-    msg_list = []
-    delivered = []
-    for m in messages:
-        digits = _extract_normalized_otp(m.otp_message)
-        if not digits:
-            continue
-        msg_list.append(
-            {
-                "checkedAt": _format_bdt(m.created_at),
-                "count": len(msg_list) + 1,
-                "message": digits,
-                "used": bool(m.is_used),
-            }
-        )
-        delivered.append(m)
+    if row is None:
+        return jsonify({}), 200
 
-    # Only rows actually returned are consumed. Marking every matched row used
-    # would let one poller consume an OTP that another client still needs.
-    for m in delivered:
-        m.is_used = True
-    if delivered:
-        db.session.commit()
+    # Only a normalized digit OTP is a real code (drops junk rows).
+    digits = _extract_normalized_otp(row.otp_message)
+    if not digits:
+        return jsonify({}), 200
 
-    return jsonify(msg_list), 200
+    return jsonify(
+        {
+            "message": digits,
+            "last_updated": _format_bdt(row.updated_at),
+        }
+    ), 200
 
 
 # ── WebSocket ──────────────────────────────────────────────────

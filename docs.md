@@ -52,11 +52,9 @@ Each OTP arrives as a separate WebSocket message:
 
 ```json
 {
-  "id": 123,
   "otp": "129000",
   "phone": "01612345678",
-  "used": false,
-  "created_at": "2026-09-23T15:48:23.095+06:00"
+  "last_updated": "2026-09-23T15:48:23.095+06:00"
 }
 ```
 
@@ -127,9 +125,12 @@ to the socket — so it records *sent*, not *read*.
 ## How an OTP reaches a client
 
 1. `POST /api/messages` stores the message and normalizes the OTP to digits.
+   Each number keeps exactly one row: a new OTP overwrites the previous
+   one (`updated_at` moves forward, `revision` bumps).
 2. `OTPBroker.publish()` delivers it to WebSocket clients **in this process**.
-3. Every worker polls `otp_message` for rows newer than the last id it saw and
-   delivers them to its own subscribed clients, deduplicated by OTP id.
+3. Every worker polls `otp_message` for rows with a `revision` newer than
+   the last one it saw and delivers them to its own subscribed clients,
+   deduplicated by phone + `last_updated`.
 
 **No broker is required.** Each worker's WebSocket registry lives only in that
 worker's memory, so an OTP ingested by one worker has to reach the clients held by
@@ -154,8 +155,12 @@ delivery faster:
 trades a service to operate for latency nobody can feel.
 
 `OTPMessage` is the retention store (purged after `OTP_RETENTION_MINUTES` on each
-`GET /api/messages/<phone>`). `OTP_POLL_INTERVAL` (default `0.5`s) controls how
-often a worker checks; a worker with no connected clients skips the query entirely.
+`GET /api/messages/<phone>`), holding one row per phone. That endpoint
+returns the latest code for a number as a single object:
+`{"message": "123456", "last_updated": "…+06:00"}` (`{}` when the number
+has no OTP in the retention window). `OTP_POLL_INTERVAL` (default `0.5`s)
+controls how often a worker checks; a worker with no connected clients skips
+the query entirely.
 
 ## Deployment (gunicorn + pm2)
 

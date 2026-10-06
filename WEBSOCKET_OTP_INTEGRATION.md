@@ -13,7 +13,7 @@ OrbitalCore OTP has two selectable methods (Settings → OrbitalCore OTP):
 
 | Method | Transport | Behavior |
 |--------|-----------|----------|
-| **HTTP** | `GET /api/messages/<phone>` | Poll for unused OTPs |
+| **HTTP** | `GET /api/messages/<phone>` | Poll the latest OTP for a number |
 | **WS** | Native WebSocket `wss://…/ws/otp` | Server pushes OTPs for subscribed phones |
 
 There is also a separate **Backup OTP Socket** (Socket.IO to third-party OTP servers). That is **not** the OrbitalCore WS system described here.
@@ -159,9 +159,7 @@ Typical OTP push fields:
 |-------|-----|
 | `phone` | Route to the correct `OtpClient` set |
 | `otp` | 6–8 digit code |
-| `used` | If `true`, ignore |
-| `id` | Deduplicate (remember last ~500 ids) |
-| `created_at` | Freshness: must be within **5 minutes** (`OTP_MAX_AGE_MS`) |
+| `last_updated` | Freshness + dedup key: must be within **5 minutes** (`OTP_MAX_AGE_MS`) |
 
 Delivery:
 
@@ -181,12 +179,9 @@ After WS `open`, `_recoverMissedOtps()` calls `fetchOtpSms(phone)` for each watc
 
 HTTP rules (current):
 
-- Age window: **5 minutes**
-- Only `used === false`
-- Newest first (`checkedAt` / `created_at`)
-- Supports both API shapes:
-  - Docs: `{ messages: [{ otp, used, created_at }] }`
-  - Live: `[{ message, used, checkedAt }]`
+- Age window: **5 minutes** (`last_updated`)
+- One object per number: `{ message, last_updated }` — the
+  latest code only, no `used` flag and no list
 
 This is recovery / HTTP-method logic — not a second WebSocket.
 

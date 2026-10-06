@@ -72,13 +72,27 @@ class DeviceUser(db.Model):
 
 
 class OTPMessage(db.Model):
+    # One row per phone: a new OTP for a known number overwrites the
+    # existing row instead of appending a second one.
     id = db.Column(db.Integer, primary_key=True)
-    phone = db.Column(db.String(20), nullable=False)
+    phone = db.Column(db.String(20), nullable=False, unique=True)
     otp_message = db.Column(db.String(200), nullable=False)
-    is_used = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
     message_pub = db.Column(
         db.String(16),
         nullable=False,
         default=DEFAULT_MESSAGE_PUB,
     )
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # A new OTP reuses the row, so the id never moves. The delivery
+    # poller follows this counter to see every arrival.
+    revision = db.Column(db.BigInteger, nullable=False, default=0)
+
+
+class OTPRevision(db.Model):
+    """Single-row monotonic counter over OTP arrivals."""
+
+    __tablename__ = "otp_revision"
+
+    id = db.Column(db.Integer, primary_key=True)
+    value = db.Column(db.BigInteger, nullable=False, default=0)

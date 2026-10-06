@@ -368,9 +368,10 @@ class WebSocketEndToEndTests(unittest.TestCase):
                 response = by_phone[phone][0]
                 self.assertEqual(response["phone"], phone)
                 self.assertEqual(response["otp"], otp)
-                self.assertIsInstance(response["id"], int)
-                self.assertFalse(response["used"])
-                self.assertTrue(response["created_at"].endswith("+06:00"))
+                self.assertEqual(
+                    sorted(response), ["last_updated", "otp", "phone"]
+                )
+                self.assertTrue(response["last_updated"].endswith("+06:00"))
         finally:
             for client in clients:
                 client.join(timeout=2)

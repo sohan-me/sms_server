@@ -62,10 +62,12 @@ class OTPServerTests(unittest.TestCase):
             db.create_all()
         with app.ws_clients_lock:
             app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
 
     def tearDown(self):
         with app.ws_clients_lock:
             app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
         with app.app_context():
             db.session.remove()
             db.drop_all()
@@ -163,7 +165,13 @@ class OTPServerTests(unittest.TestCase):
         register_client(dead, 1, ["01712345678"])
         register_client(survivor, 2, ["01712345678"])
 
-        _broadcast_otp({"phone": "01712345678", "otp": "123456", "id": 991})
+        _broadcast_otp(
+            {
+                "phone": "01712345678",
+                "otp": "123456",
+                "last_updated": "2026-01-01T00:00:00.000+06:00",
+            }
+        )
 
         self.assertNotIn(id(dead), app.ws_clients)
         self.assertEqual(len(dead.closed), 1)
@@ -197,7 +205,11 @@ class OTPServerTests(unittest.TestCase):
 
         def broadcast(index):
             _broadcast_otp(
-                {"phone": "01712345678", "otp": f"5555{index:02d}", "id": index}
+                {
+                    "phone": "01712345678",
+                    "otp": f"5555{index:02d}",
+                    "last_updated": f"2026-01-01T00:00:{index:02d}.000+06:00",
+                }
             )
 
         threads = [threading.Thread(target=broadcast, args=(i,)) for i in range(12)]
@@ -209,22 +221,16 @@ class OTPServerTests(unittest.TestCase):
         self.assertEqual(peak["now"], 1, "writes to one socket overlapped")
         self.assertEqual(len(ws.sent), 12)
 
-    def test_http_returns_a_bare_list_with_the_documented_item_shape(self):
+    def test_http_returns_a_single_object_with_the_documented_keys(self):
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         with app.app_context():
-            db.session.add_all(
-                [
-                    OTPMessage(
-                        phone="01712345678",
-                        otp_message="111111",
-                        created_at=now - timedelta(minutes=2),
-                    ),
-                    OTPMessage(
-                        phone="01712345678",
-                        otp_message="222222",
-                        created_at=now - timedelta(minutes=1),
-                    ),
-                ]
+            db.session.add(
+                OTPMessage(
+                    phone="01712345678",
+                    otp_message="111111",
+                    created_at=now - timedelta(minutes=2),
+                    updated_at=now - timedelta(minutes=1),
+                )
             )
             db.session.commit()
 
@@ -233,66 +239,57 @@ class OTPServerTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
-        # The body is a bare JSON array — no envelope object wrapping it.
-        self.assertIsInstance(payload, list)
+        # One row per number: the body is a single object, not a list.
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(sorted(payload), ["last_updated", "message"])
+        self.assertEqual(payload["message"], "111111")
+        self.assertTrue(payload["last_updated"].endswith("+06:00"))
 
-        # Each item is exactly these four keys and no others.
-        self.assertEqual(len(payload), 2)
-        for item in payload:
-            self.assertIsInstance(item, dict)
-            self.assertEqual(
-                sorted(item), ["checkedAt", "count", "message", "used"]
+    def test_ingesting_a_newer_otp_overwrites_the_number_s_row(self):
+        client = app.test_client()
+
+        for code in ("111111", "222222"):
+            response = client.post(
+                "/api/messages",
+                json={"phone": "01712345679", "message": f"code {code}"},
             )
+            self.assertEqual(response.status_code, 201)
 
-        # `count` is a 1-based ordinal in return order, not a list length.
-        self.assertEqual([item["count"] for item in payload], [1, 2])
-        self.assertEqual(
-            [item["message"] for item in payload], ["111111", "222222"]
-        )
+        with app.app_context():
+            rows = OTPMessage.query.filter_by(phone="01712345679").all()
 
-        # `checkedAt` is each OTP's own arrival time, so a client can tell which
-        # code is newest without re-sorting on a shared response timestamp.
-        times = [item["checkedAt"] for item in payload]
-        self.assertEqual(len(set(times)), 2)
-        self.assertEqual(times, sorted(times))
-        for item in payload:
-            self.assertTrue(item["checkedAt"].endswith("+06:00"))
+        # No new object per OTP: the second arrival updated the row.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].otp_message, "code 222222")
 
-    def test_http_reports_each_otp_as_its_own_object(self):
-        """One OTP -> count 1; three OTPs -> counts 1,2,3, never a shared shape."""
+        payload = client.get("/api/messages/01712345679").get_json()
+        self.assertEqual(payload["message"], "222222")
+
+    def test_http_returns_only_the_latest_otp_for_a_number(self):
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         with app.app_context():
-            for i in range(3):
-                db.session.add(
-                    OTPMessage(
-                        phone="01712345679",
-                        otp_message="10000%d" % i,
-                        created_at=now - timedelta(minutes=3 - i),
-                    )
-                )
+            row = OTPMessage(
+                phone="01712345680",
+                otp_message="100000",
+                created_at=now - timedelta(minutes=3),
+                updated_at=now - timedelta(minutes=3),
+            )
+            db.session.add(row)
+            db.session.commit()
+            row.otp_message = "200000"
+            row.updated_at = now - timedelta(minutes=1)
             db.session.commit()
 
-        payload = app.test_client().get("/api/messages/01712345679").get_json()
+        payload = app.test_client().get("/api/messages/01712345680").get_json()
 
-        self.assertIsInstance(payload, list)
-        self.assertEqual([item["count"] for item in payload], [1, 2, 3])
-        self.assertEqual(
-            [item["message"] for item in payload],
-            ["100000", "100001", "100002"],
-        )
-        # No shared/duplicated object: each OTP carries its own timestamp.
-        for item in payload:
-            self.assertEqual(
-                sorted(item), ["checkedAt", "count", "message", "used"]
-            )
-        self.assertEqual(len({item["checkedAt"] for item in payload}), 3)
+        self.assertEqual(payload["message"], "200000")
 
-    def test_http_returns_an_empty_list_when_nothing_matches(self):
+    def test_http_returns_an_empty_object_when_nothing_matches(self):
         response = app.test_client().get("/api/messages/01700000000")
         payload = response.get_json()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payload, [])
+        self.assertEqual(payload, {})
 
     def test_authentication_accepts_any_two_matching_fingerprint_fields(self):
         with app.app_context():
@@ -420,6 +417,16 @@ class RedisIsOptionalTests(unittest.TestCase):
     app stops starting on any host without the package and delivery breaks.
     """
 
+    def setUp(self):
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+
+    def tearDown(self):
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+
     def test_broker_is_inert_without_a_redis_url(self):
         from otp_broker import OTPBroker
 
@@ -458,17 +465,54 @@ class RedisIsOptionalTests(unittest.TestCase):
         broker = OTPBroker("", on_message=_broadcast_otp)
         broker.publish(
             {
-                "id": 4242,
                 "otp": "135790",
                 "phone": "01712345678",
-                "used": False,
-                "created_at": _format_bdt(),
+                "last_updated": _format_bdt(),
             }
         )
 
         self.assertEqual(len(client_ws.sent), 1)
         self.assertEqual(client_ws.sent[0]["otp"], "135790")
         self.assertEqual(client_ws.sent[0]["phone"], "01712345678")
+
+    def test_the_same_arrival_is_not_delivered_twice(self):
+        """Local publish plus its Redis/poller echo must reach the client once."""
+        client_ws = FakeSocket()
+        register_client(client_ws, 1, ["01712345678"])
+
+        frame = {
+            "otp": "135790",
+            "phone": "01712345678",
+            "last_updated": "2026-01-01T00:00:00.000+06:00",
+        }
+        _broadcast_otp(dict(frame))
+        _broadcast_otp(dict(frame))
+
+        self.assertEqual(len(client_ws.sent), 1)
+
+    def test_a_newer_otp_for_the_same_number_still_delivers(self):
+        """The row is reused per number, so the arrival time — not the
+        row id — is what makes two OTPs for one phone distinct."""
+        client_ws = FakeSocket()
+        register_client(client_ws, 1, ["01712345678"])
+
+        _broadcast_otp(
+            {
+                "otp": "111111",
+                "phone": "01712345678",
+                "last_updated": "2026-01-01T00:00:00.000+06:00",
+            }
+        )
+        _broadcast_otp(
+            {
+                "otp": "222222",
+                "phone": "01712345678",
+                "last_updated": "2026-01-01T00:00:01.000+06:00",
+            }
+        )
+
+        self.assertEqual(len(client_ws.sent), 2)
+        self.assertEqual(client_ws.sent[1]["otp"], "222222")
 
 
 def tearDownModule():
