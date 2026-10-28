@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "_comment": [
+    "Classification rules for the signin / payment / transaction SMS channels.",
+    "sms_parser.py reloads this file when its mtime changes, so a provider that",
+    "changes its wording or separators can be handled by editing this file and",
+    "restarting the workers — no code change, no redeploy.",
+    "",
+    "brands: matched against the message body first, then against the sender",
+    "  address (which the SMS forwarder posts as `sender`). A brand decides the",
+    "  family; the first matching entry wins, so keep the most specific first.",
+    "keywords.otp: a message needs one of these plus an extractable code before",
+    "  it can be an OTP at all. Add wording here when a provider changes it.",
+    "keywords.signin: sign-in vocabulary, used when the sender/brand is unknown.",
+    "trx_anchors: the labels a transaction ID follows. The token right after the",
+    "  anchor is read as the TRX ID.",
+    "senders: optional map for sender addresses that carry no brand name in the",
+    "  body, e.g. a numeric gateway number. Keys are compared case-insensitively",
+    "  and, for numeric addresses, digit for digit. Purely a hint — routing never",
+    "  depends on it, so a provider changing its sender number cannot break."
+  ],
+  "brands": [
+    {
+      "label": "IVAC",
+      "family": "signin",
+      "aliases": ["ivac", "i-vac", "ivacbd", "ivac bd"]
+    },
+    {
+      "label": "bKash",
+      "family": "payment",
+      "aliases": ["bkash", "b-kash"]
+    },
+    {
+      "label": "Nagad",
+      "family": "payment",
+      "aliases": ["nagad"]
+    },
+    {
+      "label": "DBBL",
+      "family": "payment",
+      "aliases": [
+        "dbbl",
+        "dutch-bangla bank",
+        "dutch bangla bank",
+        "dutch-bangla",
+        "dutch bangla"
+      ]
+    },
+    {
+      "label": "Rocket",
+      "family": "payment",
+      "aliases": ["rocket"]
+    },
+    {
+      "label": "Upay",
+      "family": "payment",
+      "aliases": ["upay", "u-pay"]
+    }
+  ],
+  "keywords": {
+    "otp": [
+      "otp",
+      "o.t.p",
+      "one time password",
+      "one-time password",
+      "verification code",
+      "verify code",
+      "security code",
+      "confirmation code",
+      "login code",
+      "your code",
+      "code is",
+      "code:"
+    ],
+    "signin": [
+      "ivac",
+      "login",
+      "log in",
+      "sign in",
+      "signin",
+      "sign-in",
+      "appointment"
+    ]
+  },
+  "trx_anchors": [
+    "transaction number",
+    "transaction id",
+    "transaction no",
+    "transactionid",
+    "trx id",
+    "trx no",
+    "trxid",
+    "txn id",
+    "txn no",
+    "txnid",
+    "trx",
+    "txn"
+  ],
+  "senders": {}
+}

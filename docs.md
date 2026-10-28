@@ -60,6 +60,71 @@ Each OTP arrives as a separate WebSocket message:
 
 Use `phone` to identify which number received the OTP.
 
+## Channels
+
+One ingest endpoint feeds three channels, each with its own WebSocket and HTTP
+endpoint. The channel is decided from the message **body**; the sender address is
+only a label, so a provider changing its sender number cannot break routing.
+
+| Channel | WebSocket | HTTP | Code field |
+|---|---|---|---|
+| Sign-in OTP (IVAC) | `/ws/otp/signin` | `GET /api/signin/<phone>` | `otp` |
+| Payment OTP (bKash, Nagad, DBBL, Rocket, Upay) | `/ws/otp/payment` | `GET /api/payment/<phone>` | `otp` |
+| Transaction ID after payment | `/ws/otp/transaction` | `GET /api/transaction/<phone>` | `trx` |
+| Transaction history | — | `GET /api/transaction/<phone>/history?limit=50` | — |
+
+Auth and `subscribe` are identical on all three sockets; only the path changes, and
+each connection only ever receives its own channel's frames even when several
+channels watch the same number.
+
+```json
+{
+  "kind": "payment",
+  "otp": "123456",
+  "phone": "01712345678",
+  "receiver": "01712345678",
+  "sender": "bKash",
+  "sender_number": "8801XXXXXXXXX",
+  "last_updated": "2026-10-29T12:00:00.000+06:00"
+}
+```
+
+A transaction frame carries `trx` (and `amount` when the body has one) and **no**
+`otp`, so an amount can never be mistaken for a code:
+
+```json
+{
+  "kind": "transaction",
+  "trx": "9HABCDEFG1",
+  "amount": "500.00",
+  "phone": "01712345678",
+  "receiver": "01712345678",
+  "sender": "bKash",
+  "sender_number": "8801XXXXXXXXX",
+  "last_updated": "2026-10-29T12:00:00.000+06:00"
+}
+```
+
+`GET /api/transaction/<phone>/history` returns `{"transactions": [...]}` newest
+first; the latest-only endpoints return `{}` when nothing is in the retention
+window, like `/api/messages/<phone>` always has.
+
+**Compatibility.** `/ws/otp` and `GET /api/messages/<phone>` are unchanged aliases
+for the sign-in channel: same auth, same `subscribe` protocol, and a frame with
+exactly `otp`, `phone`, `last_updated`. Existing clients need no change.
+
+Send the sender address on ingest when the forwarder has it; it improves the label
+and resolves templates whose body omits the brand:
+
+```json
+{ "phone": "01712345678", "message": "...", "sender": "bKash" }
+```
+
+Messages that match no channel are stored as `unknown` (so they can be inspected)
+and are pushed to no socket. The parsers and their separators live in
+`sms_patterns.json`; a provider changing its wording or the `-` → `_` separator is
+a file edit, not a code change.
+
 ## Important
 
 - Subscribe again after every reconnect.
@@ -124,9 +189,10 @@ to the socket — so it records *sent*, not *read*.
 
 ## How an OTP reaches a client
 
-1. `POST /api/messages` stores the message and normalizes the OTP to digits.
-   Each number keeps exactly one row: a new OTP overwrites the previous
-   one (`updated_at` moves forward, `revision` bumps).
+1. `POST /api/messages` classifies the message, stores it and normalizes the OTP to
+   digits. Each number keeps exactly one row **per channel**: a new sign-in OTP
+   overwrites the previous sign-in row, and a payment OTP gets its own row
+   (`updated_at` moves forward, `revision` bumps).
 2. `OTPBroker.publish()` delivers it to WebSocket clients **in this process**.
 3. Every worker polls `otp_message` for rows with a `revision` newer than
    the last one it saw and delivers them to its own subscribed clients,

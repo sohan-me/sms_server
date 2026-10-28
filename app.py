@@ -28,8 +28,16 @@ from models import (
     AdminUser,
     DeviceUser,
     OTPMessage,
+    PaymentTransaction,
     db,
     generate_ws_token,
+)
+from sms_parser import (
+    DELIVERY_KINDS,
+    KIND_PAYMENT,
+    KIND_SIGNIN,
+    KIND_TRANSACTION,
+    parse_sms,
 )
 
 app = Flask(__name__)
@@ -193,14 +201,197 @@ def _format_bdt(dt=None):
     return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+06:00"
 
 
+def _channel_payload(kind, phone, code, sender, sender_number, last_updated, amount=""):
+    """The body every channel shares.
+
+    `phone` sits beside `receiver` because the original client reads `phone`;
+    a transaction frame has no `otp` at all, so a payment amount can never be
+    mistaken for a code by a consumer that only looks for `otp`.
+    """
+    payload = {
+        "kind": kind,
+        "phone": phone,
+        "receiver": phone,
+        "sender": sender,
+        "sender_number": sender_number,
+        "last_updated": last_updated,
+    }
+    if kind == KIND_TRANSACTION:
+        payload["trx"] = code
+        if amount:
+            payload["amount"] = amount
+    else:
+        payload["otp"] = code
+    return payload
+
+
+def _otp_row_payload(row):
+    """Build a channel payload from a stored row, or None if it has none.
+
+    Rows written before the channel split carry no `code`, so their body is
+    parsed instead and they keep flowing. `unknown` rows are kept for
+    inspection and deliberately delivered nowhere.
+    """
+    if row is None:
+        return None
+
+    kind = row.kind or KIND_SIGNIN
+    if kind not in DELIVERY_KINDS:
+        return None
+
+    code = (row.code or "").strip()
+    if kind == KIND_TRANSACTION:
+        if not code:
+            return None
+    else:
+        code = code or _extract_normalized_otp(row.otp_message)
+        if not code:
+            return None
+
+    # A row from before the split has no sender; those were IVAC sign-in OTPs.
+    sender = row.sender or (DEFAULT_MESSAGE_PUB if kind == KIND_SIGNIN else "")
+    return _channel_payload(
+        kind=kind,
+        phone=row.phone,
+        code=code,
+        sender=sender,
+        sender_number=row.sender_number or "",
+        last_updated=_format_bdt(row.updated_at),
+        amount=row.amount or "",
+    )
+
+
+OTP_MIGRATION_COLUMNS = (
+    "id",
+    "phone",
+    "kind",
+    "otp_message",
+    "message_pub",
+    "sender",
+    "sender_number",
+    "code",
+    "amount",
+    "created_at",
+    "updated_at",
+    "revision",
+)
+
+# Columns that became NOT NULL during the migration; a row written by an
+# older schema can still hold NULL, which would abort the table rebuild.
+_OTP_REBUILD_COALESCE = {
+    "kind": "'signin'",
+    "message_pub": "'IVAC'",
+    "sender": "''",
+    "sender_number": "''",
+    "code": "''",
+    "amount": "''",
+    "otp_message": "''",
+    "revision": "id",
+}
+
+_OTP_REBUILD_TABLE = "otp_message_migrated"
+
+
+def _phone_only_unique_keys(insp):
+    """Unique keys that still enforce "one row per phone".
+
+    Two shapes exist in the wild: the index an older ensure_schema_columns
+    created, and the table constraint SQLAlchemy emitted for models.py when
+    `phone` was unique=True. Both have to go before a number can hold a row per
+    channel.
+    """
+    keys = set()
+    for index in insp.get_indexes("otp_message"):
+        if index.get("unique") and list(index.get("column_names") or []) == ["phone"]:
+            name = index["name"]
+            # SQLite's implicit indexes cannot be dropped directly.
+            shape = "constraint" if name.startswith("sqlite_autoindex") else "index"
+            keys.add((shape, name))
+    for constraint in insp.get_unique_constraints("otp_message"):
+        if list(constraint.get("column_names") or []) == ["phone"]:
+            keys.add(("constraint", constraint["name"]))
+    return keys
+
+
+def _has_phone_kind_unique_key(insp):
+    target = ["phone", "kind"]
+    for index in insp.get_indexes("otp_message"):
+        if index.get("unique") and list(index.get("column_names") or []) == target:
+            return True
+    for constraint in insp.get_unique_constraints("otp_message"):
+        if list(constraint.get("column_names") or []) == target:
+            return True
+    return False
+
+
+def _rebuild_otp_message_for_composite_key(conn, columns):
+    """Remove a phone-only UNIQUE *constraint* on SQLite.
+
+    SQLite has no ALTER TABLE ... DROP CONSTRAINT. A database created by the
+    previous models.py (`phone` unique=True) carries exactly that constraint,
+    and it would reject the second channel's row for a number while appearing
+    in no index list -- so the table has to be rebuilt once.
+
+    The rebuild is transactional, keeps ids and revisions (the delivery
+    poller's cursor), and only copies columns the current schema knows about.
+    """
+    conn.execute(
+        text(
+            f"""
+            CREATE TABLE {_OTP_REBUILD_TABLE} (
+                id INTEGER NOT NULL,
+                phone VARCHAR(20) NOT NULL,
+                kind VARCHAR(16) NOT NULL DEFAULT 'signin',
+                otp_message VARCHAR(200) NOT NULL,
+                message_pub VARCHAR(16) NOT NULL DEFAULT 'IVAC',
+                sender VARCHAR(64) NOT NULL DEFAULT '',
+                sender_number VARCHAR(32) NOT NULL DEFAULT '',
+                code VARCHAR(32) NOT NULL DEFAULT '',
+                amount VARCHAR(20) NOT NULL DEFAULT '',
+                created_at DATETIME,
+                updated_at DATETIME,
+                revision BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (id)
+            )
+            """
+        )
+    )
+    dropped = sorted(set(columns) - set(OTP_MIGRATION_COLUMNS))
+    if dropped:
+        # Say so rather than silently discarding a column nobody remembers:
+        # the old `is_used` flag is the one this actually hits.
+        logging.getLogger(__name__).warning(
+            "Rebuilding otp_message for the (phone, kind) unique key; the "
+            "rebuild drops columns that are no longer in the schema: %s",
+            ", ".join(dropped),
+        )
+
+    copied = [name for name in OTP_MIGRATION_COLUMNS if name in columns]
+    selection = [
+        f"COALESCE({name}, {_OTP_REBUILD_COALESCE[name]})"
+        if name in _OTP_REBUILD_COALESCE
+        else name
+        for name in copied
+    ]
+    conn.execute(
+        text(
+            f"INSERT INTO {_OTP_REBUILD_TABLE} ({', '.join(copied)}) "
+            f"SELECT {', '.join(selection)} FROM otp_message"
+        )
+    )
+    conn.execute(text("DROP TABLE otp_message"))
+    conn.execute(text(f"ALTER TABLE {_OTP_REBUILD_TABLE} RENAME TO otp_message"))
+
+
 def ensure_schema_columns():
     insp = inspect(db.engine)
     tables = set(insp.get_table_names())
 
     if "otp_message" in tables:
-        cols = {c["name"] for c in insp.get_columns("otp_message")}
+        columns = {c["name"] for c in insp.get_columns("otp_message")}
+        phone_keys = _phone_only_unique_keys(insp)
         with db.engine.begin() as conn:
-            if "message_pub" not in cols:
+            if "message_pub" not in columns:
                 conn.execute(
                     text(
                         "ALTER TABLE otp_message ADD COLUMN message_pub VARCHAR(16) DEFAULT 'IVAC'"
@@ -211,23 +402,24 @@ def ensure_schema_columns():
                         "UPDATE otp_message SET message_pub = 'IVAC' WHERE message_pub IS NULL"
                     )
                 )
+                columns.add("message_pub")
 
-            # The store keeps one row per phone now: a new OTP overwrites
-            # the existing row. Collapse any history first so the unique
-            # index can be created.
-            conn.execute(
-                text(
-                    "DELETE FROM otp_message WHERE id NOT IN "
-                    "(SELECT MAX(id) FROM otp_message GROUP BY phone)"
-                )
-            )
-            conn.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_otp_message_phone "
-                    "ON otp_message (phone)"
-                )
-            )
-            if "updated_at" not in cols:
+            # Each channel keeps its own row per number, so a payment OTP can
+            # never overwrite the sign-in OTP for the same phone.
+            for name, ddl in (
+                ("kind", "VARCHAR(16) NOT NULL DEFAULT 'signin'"),
+                ("sender", "VARCHAR(64) NOT NULL DEFAULT ''"),
+                ("sender_number", "VARCHAR(32) NOT NULL DEFAULT ''"),
+                ("code", "VARCHAR(32) NOT NULL DEFAULT ''"),
+                ("amount", "VARCHAR(20) NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    conn.execute(
+                        text(f"ALTER TABLE otp_message ADD COLUMN {name} {ddl}")
+                    )
+                    columns.add(name)
+
+            if "updated_at" not in columns:
                 conn.execute(
                     text("ALTER TABLE otp_message ADD COLUMN updated_at DATETIME")
                 )
@@ -237,12 +429,54 @@ def ensure_schema_columns():
                         "WHERE updated_at IS NULL"
                     )
                 )
-            if "revision" not in cols:
+                columns.add("updated_at")
+            if "revision" not in columns:
                 conn.execute(
                     text("ALTER TABLE otp_message ADD COLUMN revision BIGINT")
                 )
                 conn.execute(
                     text("UPDATE otp_message SET revision = id WHERE revision IS NULL")
+                )
+                columns.add("revision")
+
+            conn.execute(
+                text("UPDATE otp_message SET kind = 'signin' WHERE kind IS NULL OR kind = ''")
+            )
+            # Collapse any history per (phone, kind) so the unique key can be
+            # created. Rows without a kind were sign-in OTPs before this change.
+            conn.execute(
+                text(
+                    "DELETE FROM otp_message WHERE id NOT IN "
+                    "(SELECT MAX(id) FROM otp_message GROUP BY phone, kind)"
+                )
+            )
+
+            rebuilt = False
+            for shape, name in sorted(phone_keys):
+                if shape == "index":
+                    conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+                    continue
+                if db.engine.dialect.name == "sqlite":
+                    # Reflection can report the same constraint twice (as an
+                    # autoindex and as a constraint); one rebuild is enough.
+                    if not rebuilt:
+                        _rebuild_otp_message_for_composite_key(conn, columns)
+                        rebuilt = True
+                else:
+                    conn.execute(
+                        text(f'ALTER TABLE otp_message DROP CONSTRAINT IF EXISTS "{name}"')
+                    )
+
+        # A fresh database already has the composite key from models.py; an
+        # old one only gets it here. Checking after the commit is what makes
+        # this correct for both without creating a duplicate index.
+        if not _has_phone_kind_unique_key(inspect(db.engine)):
+            with db.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS ix_otp_message_phone_kind "
+                        "ON otp_message (phone, kind)"
+                    )
                 )
 
     # The counter must never lag behind the rows it counts, and every
@@ -322,10 +556,11 @@ def _unregister_ws(connection_id, expected_ws=None, close_reason=1000, close_mes
 def _broadcast_otp(payload: dict):
     # Deduplicate the same arrival reaching this worker twice: the local
     # publish plus its Redis echo, or the poller re-reading a row this
-    # worker already delivered. A number's row is reused, so the arrival
-    # timestamp is the per-delivery identity.
+    # worker already delivered. A row is reused per (phone, kind), so the
+    # channel has to be part of the identity.
+    kind = payload.get("kind") or KIND_SIGNIN
     phone = normalize_bd_phone(payload.get("phone"))
-    arrival_key = f"{phone}|{payload.get('last_updated')}"
+    arrival_key = f"{kind}|{phone}|{payload.get('last_updated')}"
     now = time.time()
     with app.ws_clients_lock:
         seen = getattr(app, "_otp_broadcast_seen", None)
@@ -339,7 +574,16 @@ def _broadcast_otp(payload: dict):
             return
         seen[arrival_key] = now
 
-    ws_msg = json.dumps(payload)
+    # /ws/otp predates the channels and its clients must keep receiving frames
+    # with exactly the three original keys.
+    legacy_msg = json.dumps(
+        {
+            "otp": payload.get("otp", ""),
+            "phone": payload.get("phone"),
+            "last_updated": payload.get("last_updated"),
+        }
+    )
+    full_msg = json.dumps(payload)
     with app.ws_clients_lock:
         clients = list(app.ws_clients.items())
 
@@ -348,6 +592,11 @@ def _broadcast_otp(payload: dict):
     for connection_id, client_data in clients:
         if phone not in client_data["phones"]:
             continue
+        # One connection belongs to one channel: a client subscribed to the
+        # sign-in socket must never see a payment OTP for the same number.
+        if client_data.get("channel", KIND_SIGNIN) != kind:
+            continue
+        ws_msg = legacy_msg if client_data.get("legacy") else full_msg
         try:
             # The Redis subscriber thread and this client's handler thread both
             # write to the same socket, and simple_websocket's send() mutates
@@ -369,9 +618,10 @@ def _broadcast_otp(payload: dict):
 
     if delivered == 0:
         logging.getLogger(__name__).info(
-            "OTP %s for phone %s matched no WebSocket subscription on this "
+            "%s %s for phone %s matched no WebSocket subscription on this "
             "worker; %d client(s) connected here",
-            payload.get("otp"),
+            kind,
+            payload.get("otp") or payload.get("trx"),
             phone,
             len(clients),
         )
@@ -448,16 +698,10 @@ def _poll_otps_from_db(stop_event, interval=0.5):
                 )
                 for row in rows:
                     last_seen_revision = row.revision
-                    digits = _extract_normalized_otp(row.otp_message)
-                    if not digits:
+                    payload = _otp_row_payload(row)
+                    if payload is None:
                         continue
-                    _broadcast_otp(
-                        {
-                            "otp": digits,
-                            "phone": row.phone,
-                            "last_updated": _format_bdt(row.updated_at),
-                        }
-                    )
+                    _broadcast_otp(payload)
                 if rows:
                     db.session.remove()
             except Exception:
@@ -541,7 +785,7 @@ def _parse_subscription(raw_message):
     return phones, None
 
 
-def _serve_ws_connection(ws, user_id):
+def _serve_ws_connection(ws, user_id, channel=KIND_SIGNIN, legacy=False):
     otp_broker.start()
     connection_id = id(ws)
     with app.ws_clients_lock:
@@ -549,6 +793,9 @@ def _serve_ws_connection(ws, user_id):
             "ws": ws,
             "user_id": user_id,
             "phones": set(),
+            "channel": channel,
+            # /ws/otp keeps its original three-key frame shape.
+            "legacy": legacy,
             "send_lock": threading.Lock(),
         }
 
@@ -669,6 +916,10 @@ def index():
 def api_health():
     with app.ws_clients_lock:
         ws_clients = len(app.ws_clients)
+        ws_clients_by_channel = {kind: 0 for kind in DELIVERY_KINDS}
+        for client_data in app.ws_clients.values():
+            channel = client_data.get("channel", KIND_SIGNIN)
+            ws_clients_by_channel[channel] = ws_clients_by_channel.get(channel, 0) + 1
 
     # "redis_configured" alone used to look healthy on a worker whose Redis
     # subscriber had died. Report the two separately, plus which delivery path is
@@ -695,6 +946,7 @@ def api_health():
                 "otp_fanout": fanout,
                 "db_poller_alive": poller_alive,
                 "ws_clients": ws_clients,
+                "ws_clients_by_channel": ws_clients_by_channel,
                 "database": app.config["SQLALCHEMY_DATABASE_URI"].split("://", 1)[0],
             }
         ),
@@ -807,48 +1059,104 @@ def api_add_message():
         return jsonify({"error": "Missing phone or message"}), 400
 
     message = str(message)[:199]
-    # One row per phone: an OTP for a known number overwrites the
-    # previous one instead of appending a second row.
+    raw_sender = data.get("sender")
+    sender = raw_sender.strip() if isinstance(raw_sender, str) else ""
+
+    # The body decides the channel. The sender only labels it and resolves
+    # messages whose body omits the brand, so IVAC changing its sender number
+    # cannot reroute its OTPs.
+    parsed = parse_sms(message, sender=sender)
+
+    # One row per phone *per kind*: a new OTP overwrites the previous OTP of
+    # the same kind and leaves the other channels' rows alone.
     now = datetime.utcnow()
     revision = _next_otp_revision()
     db.session.execute(
         text(
             """
             INSERT INTO otp_message
-                (phone, otp_message, message_pub, created_at, updated_at, revision)
-            VALUES (:phone, :message, :pub, :now, :now, :revision)
-            ON CONFLICT (phone) DO UPDATE SET
+                (phone, kind, otp_message, message_pub, sender, sender_number,
+                 code, amount, created_at, updated_at, revision)
+            VALUES (:phone, :kind, :message, :pub, :sender, :sender_number,
+                    :code, :amount, :now, :now, :revision)
+            ON CONFLICT (phone, kind) DO UPDATE SET
                 otp_message = excluded.otp_message,
                 message_pub = excluded.message_pub,
+                sender = excluded.sender,
+                sender_number = excluded.sender_number,
+                code = excluded.code,
+                amount = excluded.amount,
                 updated_at = excluded.updated_at,
                 revision = excluded.revision
             """
         ),
         {
             "phone": phone,
+            "kind": parsed.kind,
             "message": message,
-            "pub": DEFAULT_MESSAGE_PUB,
+            "pub": (parsed.sender or DEFAULT_MESSAGE_PUB)[:16],
+            "sender": parsed.sender[:64],
+            "sender_number": parsed.sender_number[:32],
+            "code": parsed.code[:32],
+            "amount": parsed.amount[:20],
             "now": now,
             "revision": revision,
         },
     )
-    db.session.commit()
 
-    otp_digits = _extract_normalized_otp(message)
-    if otp_digits:
-        otp_broker.publish(
+    if parsed.kind == KIND_TRANSACTION:
+        # The row above only keeps the latest transaction for delivery; this
+        # table keeps every TRX ID, and a retried POST cannot duplicate one.
+        db.session.execute(
+            text(
+                """
+                INSERT INTO payment_transaction
+                    (phone, trx_id, amount, sender, sender_number, raw_message,
+                     created_at)
+                VALUES (:phone, :trx, :amount, :sender, :sender_number, :raw,
+                        :now)
+                ON CONFLICT (phone, trx_id) DO NOTHING
+                """
+            ),
             {
-                "otp": otp_digits,
                 "phone": phone,
-                "last_updated": _format_bdt(now),
-            }
+                "trx": parsed.trx[:32],
+                "amount": parsed.amount[:20],
+                "sender": parsed.sender[:64],
+                "sender_number": parsed.sender_number[:32],
+                "raw": message,
+                "now": now,
+            },
         )
 
-    return jsonify({"success": True, "message": "Message saved successfully"}), 201
+    db.session.commit()
+
+    if parsed.kind in DELIVERY_KINDS:
+        otp_broker.publish(
+            _channel_payload(
+                kind=parsed.kind,
+                phone=phone,
+                code=parsed.code,
+                sender=parsed.sender,
+                sender_number=parsed.sender_number,
+                last_updated=_format_bdt(now),
+                amount=parsed.amount,
+            )
+        )
+
+    return (
+        jsonify(
+            {
+                "success": True,
+                "message": "Message saved successfully",
+                "routed": parsed.kind,
+            }
+        ),
+        201,
+    )
 
 
-@app.route("/api/messages/<phone>", methods=["GET"], strict_slashes=False)
-def api_get_messages(phone):
+def _latest_row(phone, kind):
     retention = _otp_retention_minutes()
     expiry_threshold = datetime.utcnow() - timedelta(minutes=retention)
     OTPMessage.query.filter(OTPMessage.updated_at < expiry_threshold).delete()
@@ -856,61 +1164,169 @@ def api_get_messages(phone):
 
     norm = normalize_bd_phone(phone)
     raw_key = str(phone or "").strip()
-    row = (
+    return (
         OTPMessage.query.filter(
             or_(OTPMessage.phone == norm, OTPMessage.phone == raw_key),
+            OTPMessage.kind == kind,
         )
         .filter(OTPMessage.updated_at >= expiry_threshold)
         .order_by(OTPMessage.id.desc())
         .first()
     )
 
-    if row is None:
-        return jsonify({}), 200
 
-    # Only a normalized digit OTP is a real code (drops junk rows).
-    digits = _extract_normalized_otp(row.otp_message)
-    if not digits:
+def _channel_response(phone, kind):
+    payload = _otp_row_payload(_latest_row(phone, kind))
+    if not payload:
         return jsonify({}), 200
+    return jsonify(payload), 200
 
-    return jsonify(
-        {
-            "message": digits,
-            "last_updated": _format_bdt(row.updated_at),
-        }
-    ), 200
+
+@app.route("/api/messages/<phone>", methods=["GET"], strict_slashes=False)
+def api_get_messages(phone):
+    """Legacy endpoint: the sign-in code in the original two-key shape."""
+    payload = _otp_row_payload(_latest_row(phone, KIND_SIGNIN))
+    if not payload:
+        return jsonify({}), 200
+    return (
+        jsonify(
+            {
+                "message": payload["otp"],
+                "last_updated": payload["last_updated"],
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/signin/<phone>", methods=["GET"], strict_slashes=False)
+def api_signin(phone):
+    return _channel_response(phone, KIND_SIGNIN)
+
+
+@app.route("/api/payment/<phone>", methods=["GET"], strict_slashes=False)
+def api_payment(phone):
+    return _channel_response(phone, KIND_PAYMENT)
+
+
+@app.route("/api/transaction/<phone>", methods=["GET"], strict_slashes=False)
+def api_transaction(phone):
+    return _channel_response(phone, KIND_TRANSACTION)
+
+
+def _trx_history_retention_days():
+    raw = os.environ.get("TRX_HISTORY_RETENTION_DAYS", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return None
+
+
+@app.route("/api/transaction/<phone>/history", methods=["GET"], strict_slashes=False)
+def api_transaction_history(phone):
+    try:
+        limit = max(1, min(int(request.args.get("limit", "50")), 200))
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be an integer"}), 400
+
+    retention_days = _trx_history_retention_days()
+    if retention_days:
+        cutoff = datetime.utcnow() - timedelta(days=retention_days)
+        PaymentTransaction.query.filter(
+            PaymentTransaction.created_at < cutoff
+        ).delete()
+        db.session.commit()
+
+    norm = normalize_bd_phone(phone)
+    rows = (
+        PaymentTransaction.query.filter(PaymentTransaction.phone == norm)
+        .order_by(PaymentTransaction.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return (
+        jsonify(
+            {
+                "transactions": [
+                    {
+                        "trx": row.trx_id,
+                        "amount": row.amount,
+                        "sender": row.sender,
+                        "sender_number": row.sender_number,
+                        "phone": row.phone,
+                        "receiver": row.phone,
+                        "last_updated": _format_bdt(row.created_at),
+                    }
+                    for row in rows
+                ]
+            }
+        ),
+        200,
+    )
 
 
 # ── WebSocket ──────────────────────────────────────────────────
 
 
-@sock.route("/ws/otp")
-def ws_otp(ws):
+def _ws_identity(ws):
+    """Authenticate a WebSocket connection; returns (user_id, ok).
+
+    A failed check closes the socket here, so callers only act on `ok`.
+    """
     token = (request.args.get("token") or request.headers.get("X-WS-Token") or "").strip()
     if not token:
         ws.close(4001, "Unauthorized")
-        return
+        return None, False
 
     user = DeviceUser.query.filter_by(ws_token=token).first()
-    global_token = app.config.get("WS_AUTH_TOKEN")
     if user:
         if user.is_expired:
             user.is_active = False
             db.session.commit()
             ws.close(4003, "Expired")
-            return
+            return None, False
         if not user.is_active:
             ws.close(4003, "Inactive")
-            return
+            return None, False
+        return user.id, True
 
-        _serve_ws_connection(ws, user.id)
-        return
-
+    global_token = app.config.get("WS_AUTH_TOKEN")
     if global_token and token == global_token:
-        _serve_ws_connection(ws, None)
-        return
+        return None, True
 
     ws.close(4001, "Unauthorized")
+    return None, False
+
+
+def _serve_ws_channel(ws, channel, legacy=False):
+    user_id, ok = _ws_identity(ws)
+    if not ok:
+        return
+    _serve_ws_connection(ws, user_id, channel=channel, legacy=legacy)
+
+
+@sock.route("/ws/otp")
+def ws_otp(ws):
+    # Legacy path: sign-in only, original frame shape. Existing OrbitalCore
+    # clients keep working without a change.
+    _serve_ws_channel(ws, KIND_SIGNIN, legacy=True)
+
+
+@sock.route("/ws/otp/signin")
+def ws_otp_signin(ws):
+    _serve_ws_channel(ws, KIND_SIGNIN)
+
+
+@sock.route("/ws/otp/payment")
+def ws_otp_payment(ws):
+    _serve_ws_channel(ws, KIND_PAYMENT)
+
+
+@sock.route("/ws/otp/transaction")
+def ws_otp_transaction(ws):
+    _serve_ws_channel(ws, KIND_TRANSACTION)
 
 
 # ── Admin auth ─────────────────────────────────────────────────

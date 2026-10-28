@@ -16,12 +16,19 @@ from app import (  # noqa: E402
     _broadcast_otp,
     _drop_user_ws,
     _format_bdt,
+    _otp_row_payload,
     _parse_subscription,
     _serve_ws_connection,
     _unregister_ws,
     app,
 )
 from models import DeviceUser, OTPMessage, db  # noqa: E402
+from sms_parser import (  # noqa: E402
+    KIND_PAYMENT,
+    KIND_SIGNIN,
+    KIND_TRANSACTION,
+    KIND_UNKNOWN,
+)
 
 
 class FakeSocket:
@@ -42,13 +49,15 @@ class FakeSocket:
         self.closed.append((code, reason))
 
 
-def register_client(ws, user_id, phones):
+def register_client(ws, user_id, phones, channel=KIND_SIGNIN, legacy=False):
     """Mirror the entry shape _serve_ws_connection installs."""
     with app.ws_clients_lock:
         app.ws_clients[id(ws)] = {
             "ws": ws,
             "user_id": user_id,
             "phones": set(phones),
+            "channel": channel,
+            "legacy": legacy,
             "send_lock": threading.Lock(),
         }
     return id(ws)
@@ -251,7 +260,10 @@ class OTPServerTests(unittest.TestCase):
         for code in ("111111", "222222"):
             response = client.post(
                 "/api/messages",
-                json={"phone": "01712345679", "message": f"code {code}"},
+                json={
+                    "phone": "01712345679",
+                    "message": f"Your IVAC verification code is {code}.",
+                },
             )
             self.assertEqual(response.status_code, 201)
 
@@ -260,7 +272,7 @@ class OTPServerTests(unittest.TestCase):
 
         # No new object per OTP: the second arrival updated the row.
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].otp_message, "code 222222")
+        self.assertEqual(rows[0].otp_message, "Your IVAC verification code is 222222.")
 
         payload = client.get("/api/messages/01712345679").get_json()
         self.assertEqual(payload["message"], "222222")
@@ -513,6 +525,267 @@ class RedisIsOptionalTests(unittest.TestCase):
 
         self.assertEqual(len(client_ws.sent), 2)
         self.assertEqual(client_ws.sent[1]["otp"], "222222")
+
+class ChannelRoutingTests(unittest.TestCase):
+    """One ingest, three channels: storage, HTTP and WebSocket filtering."""
+
+    def setUp(self):
+        app.config["TESTING"] = True
+        with app.app_context():
+            db.drop_all()
+            db.create_all()
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+
+    def tearDown(self):
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+        with app.app_context():
+            db.session.remove()
+            db.drop_all()
+
+    @staticmethod
+    def _post_message(client, phone, message, sender=None):
+        payload = {"phone": phone, "message": message}
+        if sender is not None:
+            payload["sender"] = sender
+        return client.post("/api/messages", json=payload)
+
+    def test_each_channel_is_stored_and_served_on_its_own_endpoint(self):
+        phone = "01712340001"
+        client = app.test_client()
+
+        signin = self._post_message(
+            client, phone, "Your IVAC verification code is ONE_TWO_THREE_FOUR_FIVE_SIX"
+        )
+        payment = self._post_message(
+            client, phone, "Your bKash OTP is 456789. Do not share.", sender="bKash"
+        )
+        transaction = self._post_message(
+            client,
+            phone,
+            "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1.",
+            sender="bKash",
+        )
+
+        self.assertEqual(signin.get_json()["routed"], KIND_SIGNIN)
+        self.assertEqual(payment.get_json()["routed"], KIND_PAYMENT)
+        self.assertEqual(transaction.get_json()["routed"], KIND_TRANSACTION)
+
+        # One row per channel for the same number, not one row overall.
+        with app.app_context():
+            self.assertEqual(OTPMessage.query.filter_by(phone=phone).count(), 3)
+
+        signin_body = client.get(f"/api/signin/{phone}").get_json()
+        self.assertEqual(signin_body["kind"], KIND_SIGNIN)
+        self.assertEqual(signin_body["otp"], "123456")
+        self.assertEqual(signin_body["sender"], "IVAC")
+        self.assertEqual(signin_body["receiver"], phone)
+        self.assertNotIn("trx", signin_body)
+
+        payment_body = client.get(f"/api/payment/{phone}").get_json()
+        self.assertEqual(payment_body["kind"], KIND_PAYMENT)
+        self.assertEqual(payment_body["otp"], "456789")
+        self.assertEqual(payment_body["sender"], "bKash")
+        self.assertNotIn("trx", payment_body)
+
+        transaction_body = client.get(f"/api/transaction/{phone}").get_json()
+        self.assertEqual(transaction_body["kind"], KIND_TRANSACTION)
+        self.assertEqual(transaction_body["trx"], "9HABCDEFG1")
+        self.assertEqual(transaction_body["amount"], "500.00")
+        self.assertNotIn("otp", transaction_body)
+
+    def test_legacy_http_endpoint_keeps_its_shape_and_only_serves_signin(self):
+        phone = "01712340002"
+        client = app.test_client()
+        self._post_message(client, phone, "Your IVAC verification code is 111222")
+        self._post_message(client, phone, "Your bKash OTP is 999888.", sender="bKash")
+
+        legacy = client.get(f"/api/messages/{phone}").get_json()
+
+        self.assertEqual(sorted(legacy), ["last_updated", "message"])
+        self.assertEqual(legacy["message"], "111222")
+
+    def test_a_sender_number_change_does_not_reroute_the_signin_otp(self):
+        phone = "01712340003"
+        client = app.test_client()
+
+        response = self._post_message(
+            client,
+            phone,
+            "Your IVAC verification code is 1_2_3_4_5_6",
+            sender="8801999999999",
+        )
+
+        self.assertEqual(response.get_json()["routed"], KIND_SIGNIN)
+        body = client.get(f"/api/signin/{phone}").get_json()
+        self.assertEqual(body["otp"], "123456")
+        self.assertEqual(body["sender"], "IVAC")
+        self.assertEqual(body["sender_number"], "8801999999999")
+
+    def test_an_unrecognised_message_is_stored_but_routed_nowhere(self):
+        phone = "01712340004"
+        client = app.test_client()
+
+        response = self._post_message(
+            client,
+            phone,
+            "Get 50% cashback on your next purchase. Valid till 31-12-2026.",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["routed"], KIND_UNKNOWN)
+        for path in ("/api/signin", "/api/payment", "/api/transaction"):
+            self.assertEqual(client.get(f"{path}/{phone}").get_json(), {})
+
+        with app.app_context():
+            self.assertIsNotNone(
+                OTPMessage.query.filter_by(phone=phone, kind=KIND_UNKNOWN).first()
+            )
+
+    def test_each_ws_endpoint_only_receives_its_own_channel(self):
+        phone = "01712340005"
+        signin_ws = FakeSocket()
+        payment_ws = FakeSocket()
+        legacy_ws = FakeSocket()
+        other_phone_ws = FakeSocket()
+        register_client(signin_ws, 1, [phone], channel=KIND_SIGNIN)
+        register_client(payment_ws, 1, [phone], channel=KIND_PAYMENT)
+        register_client(legacy_ws, 1, [phone], channel=KIND_SIGNIN, legacy=True)
+        register_client(other_phone_ws, 2, ["01600000000"], channel=KIND_SIGNIN)
+
+        _broadcast_otp(
+            {
+                "kind": KIND_PAYMENT,
+                "otp": "111111",
+                "phone": phone,
+                "receiver": phone,
+                "sender": "bKash",
+                "sender_number": "bKash",
+                "last_updated": "2026-10-29T10:00:00.000+06:00",
+            }
+        )
+
+        self.assertEqual(signin_ws.sent, [])
+        self.assertEqual(legacy_ws.sent, [])
+        self.assertEqual(len(payment_ws.sent), 1)
+        self.assertEqual(payment_ws.sent[0]["kind"], KIND_PAYMENT)
+
+        _broadcast_otp(
+            {
+                "kind": KIND_SIGNIN,
+                "otp": "222222",
+                "phone": phone,
+                "receiver": phone,
+                "sender": "IVAC",
+                "sender_number": "8801999999999",
+                "last_updated": "2026-10-29T10:00:01.000+06:00",
+            }
+        )
+
+        self.assertEqual(len(signin_ws.sent), 1)
+        self.assertEqual(signin_ws.sent[0]["kind"], KIND_SIGNIN)
+        self.assertEqual(signin_ws.sent[0]["receiver"], phone)
+        # /ws/otp keeps the original three-key frame, so old clients are intact.
+        self.assertEqual(
+            legacy_ws.sent,
+            [
+                {
+                    "otp": "222222",
+                    "phone": phone,
+                    "last_updated": "2026-10-29T10:00:01.000+06:00",
+                }
+            ],
+        )
+        self.assertEqual(other_phone_ws.sent, [])
+
+    def test_poller_payloads_are_built_per_channel_from_stored_rows(self):
+        phone = "01712340007"
+        with app.app_context():
+            db.session.add_all(
+                [
+                    # A row from before the split: no stored code, no sender.
+                    OTPMessage(
+                        phone=phone,
+                        kind=KIND_SIGNIN,
+                        otp_message="legacy IVAC code 445566",
+                    ),
+                    OTPMessage(
+                        phone=phone,
+                        kind=KIND_PAYMENT,
+                        otp_message="bKash OTP 778899",
+                        code="778899",
+                        sender="bKash",
+                    ),
+                    OTPMessage(
+                        phone=phone,
+                        kind=KIND_TRANSACTION,
+                        otp_message="TrxID 9HABCDEFG1",
+                        code="9HABCDEFG1",
+                        sender="bKash",
+                        amount="500.00",
+                    ),
+                    OTPMessage(
+                        phone=phone,
+                        kind=KIND_UNKNOWN,
+                        otp_message="promo 123456",
+                    ),
+                ]
+            )
+            db.session.commit()
+            rows = {
+                row.kind: row for row in OTPMessage.query.filter_by(phone=phone).all()
+            }
+
+            signin = _otp_row_payload(rows[KIND_SIGNIN])
+            self.assertEqual(signin["otp"], "445566")
+            self.assertEqual(signin["sender"], "IVAC")
+
+            payment = _otp_row_payload(rows[KIND_PAYMENT])
+            self.assertEqual(payment["otp"], "778899")
+            self.assertEqual(payment["sender"], "bKash")
+
+            transaction = _otp_row_payload(rows[KIND_TRANSACTION])
+            self.assertEqual(transaction["trx"], "9HABCDEFG1")
+            self.assertEqual(transaction["amount"], "500.00")
+            self.assertNotIn("otp", transaction)
+
+            # Unknown rows are stored for inspection, never delivered.
+            self.assertIsNone(_otp_row_payload(rows[KIND_UNKNOWN]))
+
+    def test_transaction_history_keeps_every_trx_and_ignores_a_repeat(self):
+        phone = "01712340006"
+        client = app.test_client()
+        first = "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1."
+        second = "Payment successful. Amount: BDT 250. TxnID: 7X9ABCDEF2"
+
+        self._post_message(client, phone, first, sender="bKash")
+        # A forwarder retry of the same SMS must not double-record the payment.
+        self._post_message(client, phone, first, sender="bKash")
+        self._post_message(client, phone, second, sender="Nagad")
+
+        history = client.get(f"/api/transaction/{phone}/history").get_json()
+        self.assertEqual(
+            [item["trx"] for item in history["transactions"]],
+            ["7X9ABCDEF2", "9HABCDEFG1"],
+        )
+        self.assertEqual(history["transactions"][1]["amount"], "500.00")
+        self.assertEqual(history["transactions"][0]["sender"], "Nagad")
+
+        limited = client.get(f"/api/transaction/{phone}/history?limit=1").get_json()
+        self.assertEqual(
+            [item["trx"] for item in limited["transactions"]], ["7X9ABCDEF2"]
+        )
+        self.assertEqual(
+            client.get("/api/transaction/01700000000/history").get_json(),
+            {"transactions": []},
+        )
+        self.assertEqual(
+            client.get(f"/api/transaction/{phone}/history?limit=abc").status_code,
+            400,
+        )
 
 
 def tearDownModule():

@@ -12,14 +12,14 @@ import urllib.request
 import uuid
 
 
-def _ws_receiver(url, phone, result_queue):
+def _ws_receiver(url, phone, result_queue, label=None):
     import websocket
 
     try:
         ws = websocket.create_connection(url, timeout=5)
         ws.send(json.dumps({"action": "subscribe", "phones": [phone]}))
         acknowledgement = json.loads(ws.recv())
-        result_queue.put(("ready", phone, acknowledgement))
+        result_queue.put(("ready", label or phone, acknowledgement))
 
         ws.settimeout(3)
         messages = []
@@ -30,10 +30,10 @@ def _ws_receiver(url, phone, result_queue):
             except websocket.WebSocketTimeoutException:
                 break
 
-        result_queue.put(("result", phone, messages))
+        result_queue.put(("result", label or phone, messages))
         ws.close()
     except Exception as exc:
-        result_queue.put(("error", phone, repr(exc)))
+        result_queue.put(("error", label or phone, repr(exc)))
 
 
 def _ws_updatable_receiver(
@@ -448,6 +448,134 @@ class WebSocketEndToEndTests(unittest.TestCase):
             if second_server.stdout:
                 second_server.stdout.close()
 
+    def test_channels_are_isolated_across_ws_and_http(self):
+        phone = "01730000001"
+        base = f"ws://127.0.0.1:{self.port}"
+        ws_paths = {
+            "signin": f"{base}/ws/otp/signin?token={self.token}",
+            "payment": f"{base}/ws/otp/payment?token={self.token}",
+            "transaction": f"{base}/ws/otp/transaction?token={self.token}",
+            "legacy": f"{base}/ws/otp?token={self.token}",
+        }
+
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        clients = []
+        try:
+            for label, url in ws_paths.items():
+                client = context.Process(
+                    target=_ws_receiver,
+                    args=(url, phone, result_queue, label),
+                )
+                client.start()
+                clients.append(client)
+
+            ready = [result_queue.get(timeout=10) for _ in range(len(ws_paths))]
+            self.assertEqual({item[0] for item in ready}, {"ready"})
+
+            # Sign-in OTP in the new underscore format, from a sender number
+            # the server has never seen: routing must follow the body.
+            self._post_sms(
+                self.port,
+                phone,
+                "Your IVAC verification code is ONE_TWO_THREE_FOUR_FIVE_SIX",
+                sender="8801999999999",
+            )
+            self._post_sms(
+                self.port,
+                phone,
+                "Your bKash OTP is 456789. Do not share it.",
+                sender="bKash",
+            )
+            self._post_sms(
+                self.port,
+                phone,
+                "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1.",
+                sender="bKash",
+            )
+
+            received = [result_queue.get(timeout=10) for _ in range(len(ws_paths))]
+            self.assertEqual({item[0] for item in received}, {"result"})
+            by_label = {label: messages for _, label, messages in received}
+
+            self.assertEqual(len(by_label["signin"]), 1)
+            signin_frame = by_label["signin"][0]
+            self.assertEqual(signin_frame["kind"], "signin")
+            self.assertEqual(signin_frame["otp"], "123456")
+            self.assertEqual(signin_frame["phone"], phone)
+            self.assertEqual(signin_frame["receiver"], phone)
+            self.assertEqual(signin_frame["sender"], "IVAC")
+            self.assertEqual(signin_frame["sender_number"], "8801999999999")
+            self.assertNotIn("trx", signin_frame)
+
+            self.assertEqual(len(by_label["payment"]), 1)
+            payment_frame = by_label["payment"][0]
+            self.assertEqual(payment_frame["kind"], "payment")
+            self.assertEqual(payment_frame["otp"], "456789")
+            self.assertEqual(payment_frame["sender"], "bKash")
+            self.assertNotIn("trx", payment_frame)
+
+            self.assertEqual(len(by_label["transaction"]), 1)
+            transaction_frame = by_label["transaction"][0]
+            self.assertEqual(transaction_frame["kind"], "transaction")
+            self.assertEqual(transaction_frame["trx"], "9HABCDEFG1")
+            self.assertEqual(transaction_frame["amount"], "500.00")
+            self.assertNotIn("otp", transaction_frame)
+
+            # The legacy socket receives sign-in only, in the original shape.
+            self.assertEqual(len(by_label["legacy"]), 1)
+            legacy_frame = by_label["legacy"][0]
+            self.assertEqual(sorted(legacy_frame), ["last_updated", "otp", "phone"])
+            self.assertEqual(legacy_frame["otp"], "123456")
+
+            signin = self._get_json(self.port, f"/api/signin/{phone}")
+            self.assertEqual(signin["otp"], "123456")
+            self.assertEqual(signin["sender"], "IVAC")
+            self.assertEqual(signin["receiver"], phone)
+
+            payment = self._get_json(self.port, f"/api/payment/{phone}")
+            self.assertEqual(payment["otp"], "456789")
+            self.assertEqual(payment["sender"], "bKash")
+
+            transaction = self._get_json(self.port, f"/api/transaction/{phone}")
+            self.assertEqual(transaction["trx"], "9HABCDEFG1")
+            self.assertNotIn("otp", transaction)
+
+            legacy = self._get_json(self.port, f"/api/messages/{phone}")
+            self.assertEqual(sorted(legacy), ["last_updated", "message"])
+            self.assertEqual(legacy["message"], "123456")
+
+            history = self._get_json(
+                self.port, f"/api/transaction/{phone}/history"
+            )
+            self.assertEqual(
+                [item["trx"] for item in history["transactions"]],
+                ["9HABCDEFG1"],
+            )
+
+            # A forwarder retry must not duplicate the recorded payment.
+            self._post_sms(
+                self.port,
+                phone,
+                "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1.",
+                sender="bKash",
+            )
+            history = self._get_json(
+                self.port, f"/api/transaction/{phone}/history"
+            )
+            self.assertEqual(len(history["transactions"]), 1)
+
+            self.assertEqual(
+                self._get_json(self.port, "/api/signin/01700000000"),
+                {},
+            )
+        finally:
+            for client in clients:
+                client.join(timeout=2)
+                if client.is_alive():
+                    client.terminate()
+                    client.join(timeout=2)
+
     def _start_server(self, port):
         return subprocess.Popen(
             [
@@ -496,13 +624,25 @@ class WebSocketEndToEndTests(unittest.TestCase):
         raise AssertionError("Server did not become ready")
 
     @staticmethod
-    def _post_sms(port, phone, message):
+    def _post_sms(port, phone, message, sender=None):
+        payload = {"phone": phone, "message": message}
+        if sender is not None:
+            payload["sender"] = sender
         WebSocketEndToEndTests._post_json(
             port,
             "/api/messages",
-            {"phone": phone, "message": message},
+            payload,
             expected_status=201,
         )
+
+    @staticmethod
+    def _get_json(port, path):
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}{path}", timeout=5
+        ) as response:
+            if response.status != 200:
+                raise AssertionError(f"Unexpected GET status: {response.status}")
+            return json.loads(response.read())
 
     @staticmethod
     def _post_json(port, path, payload, expected_status):
