@@ -35,10 +35,15 @@ module.exports = {
         OTP_RETENTION_MINUTES: "30",
         BIND: "0.0.0.0:8002",
 
-        // Capacity rule: every open WebSocket permanently occupies one thread.
-        // Total concurrent WebSocket connections must stay below
-        // WEB_CONCURRENCY * WEB_THREADS, and headroom is needed for
-        // POST /api/messages. 4 * 16 = 64 slots here.
+        // Capacity rule: every open WebSocket permanently occupies one thread
+        // (an idle socket holds no database connection). Size WEB_THREADS by the
+        // peak socket count, not workers * threads — gunicorn does not spread
+        // long-lived connections evenly, so 4 * 16 does NOT mean 64 sockets:
+        // measured, 3 workers x 16 threads stalled at 16 sockets because one
+        // worker absorbed every connection. Budget 3 sockets per user (signin,
+        // payment, transaction) plus headroom for POST /api/messages — so 16 here
+        // serves ~4-5 concurrent users, not 21. Extra workers buy ingest
+        // throughput only; raise WEB_THREADS for more users.
         WEB_CONCURRENCY: "4",
         WEB_THREADS: "16",
 

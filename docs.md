@@ -69,18 +69,54 @@ only a label, so a provider changing its sender number cannot break routing.
 | Channel | WebSocket | HTTP | Code field |
 |---|---|---|---|
 | Sign-in OTP (IVAC) | `/ws/otp/signin` | `GET /api/signin/<phone>` | `otp` |
-| Payment OTP (bKash, Nagad, DBBL, Rocket, Upay) | `/ws/otp/payment` | `GET /api/payment/<phone>` | `otp` |
-| Transaction ID after payment | `/ws/otp/transaction` | `GET /api/transaction/<phone>` | `trx` |
-| Transaction history | — | `GET /api/transaction/<phone>/history?limit=50` | — |
+| Payment OTP (bKash, Nagad, DBBL, Rocket, Upay) | `/ws/otp/payment` | `GET /api/payment/<phone>?token=…` | `otp` |
+| Transaction ID after payment | `/ws/otp/transaction` | `GET /api/transaction/<phone>?token=…` | `trx` |
+| Transaction history | — | `GET /api/transaction/<phone>/history?limit=50&token=…` | — |
 
 Auth and `subscribe` are identical on all three sockets; only the path changes, and
 each connection only ever receives its own channel's frames even when several
 channels watch the same number.
 
+### Payment numbers are claimed first
+
+Payment and transaction traffic is private per device, so a device declares the
+numbers it will pay from before paying. `POST /api/payment/numbers` with the
+`ws_token` claims them; `GET` lists them with each number's `payment_count`, and
+`DELETE /api/payment/numbers/<phone>` releases one:
+
+```http
+POST /api/payment/numbers?token=<ws_token>
+Content-Type: application/json
+
+{ "numbers": ["01712345678"] }
+```
+
+```json
+{ "numbers": [ { "phone": "01712345678", "payment_count": 0 } ] }
+```
+
+From then on, that number's payment OTPs and transactions reach only this
+device's sockets and `?token=` HTTP reads — another user subscribed to the same
+number gets nothing, and a number already claimed by someone else answers `409`.
+An arrival for an unclaimed number is stored but delivered to nobody. Sign-in is
+unchanged and needs no claim.
+
+Numbers belong to the device, not to a token, so a rotated `ws_token` never loses
+them. Send the device fingerprint (`mac_address`, `motherboard_serial`,
+`machine_guid`, `bios_serial` — any two) with the claim and the number is bound
+to that machine. If rotation re-issued the machine as a new device row, the same
+fingerprint brings the number back, counter and all, with `"reclaimed": […]` in
+the response; a different fingerprint still answers `409`.
+
+`payment_count` counts completed payments per number: `1` for the first file paid
+with it, `2` for the next with the same number, and a repeated TRX ID does not
+count again.
+
 ```json
 {
   "kind": "payment",
   "otp": "123456",
+  "payment_count": 0,
   "phone": "01712345678",
   "receiver": "01712345678",
   "sender": "bKash",
@@ -97,6 +133,7 @@ A transaction frame carries `trx` (and `amount` when the body has one) and **no*
   "kind": "transaction",
   "trx": "9HABCDEFG1",
   "amount": "500.00",
+  "payment_count": 1,
   "phone": "01712345678",
   "receiver": "01712345678",
   "sender": "bKash",
@@ -113,12 +150,17 @@ window, like `/api/messages/<phone>` always has.
 for the sign-in channel: same auth, same `subscribe` protocol, and a frame with
 exactly `otp`, `phone`, `last_updated`. Existing clients need no change.
 
-Send the sender address on ingest when the forwarder has it; it improves the label
-and resolves templates whose body omits the brand:
+The forwarder posts the receiving SIM as `receiver` and the SMS sender address as
+`sender` (`phone` is still accepted as the older name for the receiver). The sender
+address improves the label and resolves templates whose body omits the brand, so a
+Rocket transaction — which never names Rocket — is still labelled and routed:
 
 ```json
-{ "phone": "01712345678", "message": "...", "sender": "bKash" }
+{ "receiver": "01712345678", "message": "...", "sender": "16216" }
 ```
+
+The wallet shortcodes `16216` (Rocket), `16247` (bKash) and `16167` (Nagad) are
+mapped in `sms_patterns.json` under `senders`; add any new sender address there.
 
 Messages that match no channel are stored as `unknown` (so they can be inspected)
 and are pushed to no socket. The parsers and their separators live in
@@ -319,13 +361,40 @@ delivery, because each worker then only sees its own OTPs.
 
 Each open WebSocket holds one `gthread` worker thread for its whole life — the
 handler blocks in `ws.receive()` until the peer goes away — and those same threads
-serve `POST /api/messages`. So:
+serve `POST /api/messages`. An idle socket does **not** hold a database connection:
+the handler releases its session right after the token check, so sockets are bounded
+by threads, not by the SQLAlchemy pool (which is only 5 + 10 overflow by default).
+
+Size `WEB_THREADS` — not the product of workers and threads — against the peak:
 
 ```text
-concurrent WebSocket connections  <  WEB_CONCURRENCY × WEB_THREADS
+WEB_THREADS  >=  (3 x peak concurrent users) + headroom
 ```
 
-Raise `WEB_THREADS` to raise that ceiling. Note that gunicorn's `timeout` does **not**
+Three because each user opens one socket per channel — `/ws/otp/signin`,
+`/ws/otp/payment`, `/ws/otp/transaction` (plus one more if an old client still uses
+`/ws/otp`). The headroom matters as much as the multiplier: when sockets fill every
+thread, nothing is left to answer `/api/health` or accept `POST /api/messages` — at
+64 sockets on 1 x 64 threads both failed while the sockets themselves stayed up.
+
+Extra workers do not add socket headroom, because gunicorn does not spread long-lived
+connections evenly across workers. Measured on this machine, opening sockets one at a
+time until the server stopped accepting:
+
+| Workers × threads | Peak sockets accepted |
+|---|---|
+| 1 × 64 | 64 (all slots, as expected) |
+| 3 × 16 | 16 — one worker absorbed every connection and the other two stayed idle |
+| 3 × 32 | 59 — first worker at 27, the other two pinned at 16 each |
+
+The last two rows are the trap: 48 and 96 slots existed, yet the server stopped
+accepting once no single worker had a free thread, so the peer's upgrade timed out.
+Set `WEB_THREADS` above the peak socket count so any one worker can absorb them all;
+add workers only for `POST /api/messages` throughput. Each thread costs stack memory,
+so for fan-out beyond a few hundred concurrent sockets move the WebSocket routes to an
+async server instead of raising threads further.
+
+Note that gunicorn's `timeout` does **not**
 govern WebSockets: its liveness check only touches a temp file from the worker's main
 loop, which keeps running regardless of how many pool threads are stuck, so a worker
 holding dead WebSocket threads is never recycled. Server-side pings

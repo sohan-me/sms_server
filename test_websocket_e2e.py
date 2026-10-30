@@ -533,11 +533,17 @@ class WebSocketEndToEndTests(unittest.TestCase):
             self.assertEqual(signin["sender"], "IVAC")
             self.assertEqual(signin["receiver"], phone)
 
-            payment = self._get_json(self.port, f"/api/payment/{phone}")
+            # Payment and transaction reads are private now, so even this
+            # script asks with the server-wide token.
+            payment = self._get_json(
+                self.port, f"/api/payment/{phone}?token={self.token}"
+            )
             self.assertEqual(payment["otp"], "456789")
             self.assertEqual(payment["sender"], "bKash")
 
-            transaction = self._get_json(self.port, f"/api/transaction/{phone}")
+            transaction = self._get_json(
+                self.port, f"/api/transaction/{phone}?token={self.token}"
+            )
             self.assertEqual(transaction["trx"], "9HABCDEFG1")
             self.assertNotIn("otp", transaction)
 
@@ -546,7 +552,7 @@ class WebSocketEndToEndTests(unittest.TestCase):
             self.assertEqual(legacy["message"], "123456")
 
             history = self._get_json(
-                self.port, f"/api/transaction/{phone}/history"
+                self.port, f"/api/transaction/{phone}/history?token={self.token}"
             )
             self.assertEqual(
                 [item["trx"] for item in history["transactions"]],
@@ -561,7 +567,7 @@ class WebSocketEndToEndTests(unittest.TestCase):
                 sender="bKash",
             )
             history = self._get_json(
-                self.port, f"/api/transaction/{phone}/history"
+                self.port, f"/api/transaction/{phone}/history?token={self.token}"
             )
             self.assertEqual(len(history["transactions"]), 1)
 

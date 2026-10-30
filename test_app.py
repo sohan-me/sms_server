@@ -18,11 +18,12 @@ from app import (  # noqa: E402
     _format_bdt,
     _otp_row_payload,
     _parse_subscription,
+    _serve_ws_channel,
     _serve_ws_connection,
     _unregister_ws,
     app,
 )
-from models import DeviceUser, OTPMessage, db  # noqa: E402
+from models import AdminUser, DeviceUser, OTPMessage, db  # noqa: E402
 from sms_parser import (  # noqa: E402
     KIND_PAYMENT,
     KIND_SIGNIN,
@@ -61,6 +62,34 @@ def register_client(ws, user_id, phones, channel=KIND_SIGNIN, legacy=False):
             "send_lock": threading.Lock(),
         }
     return id(ws)
+
+
+def register_device(name, phones=None):
+    """An approved device with a ws_token, plus any payment numbers it claims."""
+    with app.app_context():
+        user = DeviceUser(
+            name=name,
+            mac_address=f"MAC-{name}",
+            motherboard_serial=f"MB-{name}",
+            machine_guid=f"GUID-{name}",
+            bios_serial=f"BIOS-{name}",
+            ws_token=f"token-{name}",
+            is_active=True,
+        )
+        db.session.add(user)
+        db.session.commit()
+        user_id = user.id
+
+    token = f"token-{name}"
+    if phones:
+        requested = [phones] if isinstance(phones, str) else list(phones)
+        response = app.test_client().post(
+            "/api/payment/numbers",
+            json={"numbers": requested},
+            query_string={"token": token},
+        )
+        assert response.status_code == 200, response.get_json()
+    return user_id, token
 
 
 class OTPServerTests(unittest.TestCase):
@@ -556,6 +585,9 @@ class ChannelRoutingTests(unittest.TestCase):
     def test_each_channel_is_stored_and_served_on_its_own_endpoint(self):
         phone = "01712340001"
         client = app.test_client()
+        # Payment numbers are claimed before paying; the claim is also what
+        # makes the payment/transaction reads readable.
+        _, token = register_device("channel-buyer", phone)
 
         signin = self._post_message(
             client, phone, "Your IVAC verification code is ONE_TWO_THREE_FOUR_FIVE_SIX"
@@ -585,13 +617,15 @@ class ChannelRoutingTests(unittest.TestCase):
         self.assertEqual(signin_body["receiver"], phone)
         self.assertNotIn("trx", signin_body)
 
-        payment_body = client.get(f"/api/payment/{phone}").get_json()
+        payment_body = client.get(f"/api/payment/{phone}?token={token}").get_json()
         self.assertEqual(payment_body["kind"], KIND_PAYMENT)
         self.assertEqual(payment_body["otp"], "456789")
         self.assertEqual(payment_body["sender"], "bKash")
         self.assertNotIn("trx", payment_body)
 
-        transaction_body = client.get(f"/api/transaction/{phone}").get_json()
+        transaction_body = client.get(
+            f"/api/transaction/{phone}?token={token}"
+        ).get_json()
         self.assertEqual(transaction_body["kind"], KIND_TRANSACTION)
         self.assertEqual(transaction_body["trx"], "9HABCDEFG1")
         self.assertEqual(transaction_body["amount"], "500.00")
@@ -625,6 +659,53 @@ class ChannelRoutingTests(unittest.TestCase):
         self.assertEqual(body["sender"], "IVAC")
         self.assertEqual(body["sender_number"], "8801999999999")
 
+    def test_a_forwarder_payload_with_receiver_and_sender_numbers(self):
+        client = app.test_client()
+        _, token = register_device("forwarder-buyer", "01712340006")
+
+        response = client.post(
+            "/api/messages",
+            json={
+                "receiver": "8801712340006",
+                "sender": "16216",
+                "message": "Tk4,500.00 paid through e-Commerce gateway. "
+                "TxnId: 7028086216. Don't share your PIN with anybody",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["routed"], KIND_TRANSACTION)
+
+        body = client.get(
+            f"/api/transaction/01712340006?token={token}"
+        ).get_json()
+        self.assertEqual(body["phone"], "01712340006")
+        self.assertEqual(body["receiver"], "01712340006")
+        self.assertEqual(body["sender"], "Rocket")
+        self.assertEqual(body["sender_number"], "16216")
+        self.assertEqual(body["trx"], "7028086216")
+        self.assertEqual(body["amount"], "4500.00")
+
+    def test_the_sender_address_may_arrive_as_sender_number(self):
+        phone = "01712340007"
+        client = app.test_client()
+        _, token = register_device("sender-number-buyer", phone)
+
+        response = client.post(
+            "/api/messages",
+            json={
+                "receiver": phone,
+                "sender_number": "16247",
+                "message": "Your security code is 525926. Do not share it.",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["routed"], KIND_PAYMENT)
+        body = client.get(f"/api/payment/{phone}?token={token}").get_json()
+        self.assertEqual(body["otp"], "525926")
+        self.assertEqual(body["sender"], "bKash")
+
     def test_an_unrecognised_message_is_stored_but_routed_nowhere(self):
         phone = "01712340004"
         client = app.test_client()
@@ -637,8 +718,12 @@ class ChannelRoutingTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()["routed"], KIND_UNKNOWN)
-        for path in ("/api/signin", "/api/payment", "/api/transaction"):
-            self.assertEqual(client.get(f"{path}/{phone}").get_json(), {})
+        _, token = register_device("unknown-buyer", phone)
+        self.assertEqual(client.get(f"/api/signin/{phone}").get_json(), {})
+        for path in ("/api/payment", "/api/transaction"):
+            self.assertEqual(
+                client.get(f"{path}/{phone}?token={token}").get_json(), {}
+            )
 
         with app.app_context():
             self.assertIsNotNone(
@@ -647,12 +732,13 @@ class ChannelRoutingTests(unittest.TestCase):
 
     def test_each_ws_endpoint_only_receives_its_own_channel(self):
         phone = "01712340005"
+        owner_id, _ = register_device("channel-ws-owner", phone)
         signin_ws = FakeSocket()
         payment_ws = FakeSocket()
         legacy_ws = FakeSocket()
         other_phone_ws = FakeSocket()
-        register_client(signin_ws, 1, [phone], channel=KIND_SIGNIN)
-        register_client(payment_ws, 1, [phone], channel=KIND_PAYMENT)
+        register_client(signin_ws, owner_id, [phone], channel=KIND_SIGNIN)
+        register_client(payment_ws, owner_id, [phone], channel=KIND_PAYMENT)
         register_client(legacy_ws, 1, [phone], channel=KIND_SIGNIN, legacy=True)
         register_client(other_phone_ws, 2, ["01600000000"], channel=KIND_SIGNIN)
 
@@ -758,6 +844,7 @@ class ChannelRoutingTests(unittest.TestCase):
     def test_transaction_history_keeps_every_trx_and_ignores_a_repeat(self):
         phone = "01712340006"
         client = app.test_client()
+        _, token = register_device("history-buyer", phone)
         first = "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1."
         second = "Payment successful. Amount: BDT 250. TxnID: 7X9ABCDEF2"
 
@@ -766,7 +853,9 @@ class ChannelRoutingTests(unittest.TestCase):
         self._post_message(client, phone, first, sender="bKash")
         self._post_message(client, phone, second, sender="Nagad")
 
-        history = client.get(f"/api/transaction/{phone}/history").get_json()
+        history = client.get(
+            f"/api/transaction/{phone}/history?token={token}"
+        ).get_json()
         self.assertEqual(
             [item["trx"] for item in history["transactions"]],
             ["7X9ABCDEF2", "9HABCDEFG1"],
@@ -774,17 +863,577 @@ class ChannelRoutingTests(unittest.TestCase):
         self.assertEqual(history["transactions"][1]["amount"], "500.00")
         self.assertEqual(history["transactions"][0]["sender"], "Nagad")
 
-        limited = client.get(f"/api/transaction/{phone}/history?limit=1").get_json()
+        limited = client.get(
+            f"/api/transaction/{phone}/history?limit=1&token={token}"
+        ).get_json()
         self.assertEqual(
             [item["trx"] for item in limited["transactions"]], ["7X9ABCDEF2"]
         )
+        # A number nobody claimed is not readable at all.
         self.assertEqual(
-            client.get("/api/transaction/01700000000/history").get_json(),
-            {"transactions": []},
+            client.get(
+                f"/api/transaction/01700000000/history?token={token}"
+            ).status_code,
+            403,
         )
         self.assertEqual(
-            client.get(f"/api/transaction/{phone}/history?limit=abc").status_code,
+            client.get(
+                f"/api/transaction/{phone}/history?limit=abc&token={token}"
+            ).status_code,
             400,
+        )
+
+
+class BlockingSocket:
+    """A WebSocket that subscribes once and then sits idle until released."""
+
+    def __init__(self, phones=("01712345678",)):
+        self.incoming = [json.dumps({"action": "subscribe", "phones": list(phones)})]
+        self.sent = []
+        self.acked = threading.Event()
+        self.released = threading.Event()
+
+    def receive(self):
+        if self.incoming:
+            return self.incoming.pop(0)
+        self.released.wait(10)
+        return None
+
+    def send(self, message):
+        self.sent.append(json.loads(message))
+        self.acked.set()
+
+    def close(self, code=1000, reason=""):
+        pass
+
+
+class WebSocketPoolTests(unittest.TestCase):
+    """An idle socket must not pin a database connection.
+
+    A WebSocket handler's app context lives as long as the connection, so its
+    session would keep one pooled connection checked out for the whole socket.
+    With the default pool (5 + 10 overflow) that caps a worker at ~15 sockets
+    however many threads it has, and the next socket waits `pool_timeout` and
+    then fails to upgrade. The same pool also serves `POST /api/messages`, so an
+    exhausted pool stalls ingest too.
+    """
+
+    def setUp(self):
+        app.config["TESTING"] = True
+        with app.app_context():
+            db.drop_all()
+            db.create_all()
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+
+    def tearDown(self):
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+        with app.app_context():
+            db.session.remove()
+            db.drop_all()
+
+    def test_an_idle_socket_does_not_hold_a_database_connection(self):
+        _, token = register_device("pool-user")
+        ws = BlockingSocket()
+        errors = []
+
+        def serve():
+            try:
+                with app.test_request_context(f"/ws/otp/signin?token={token}"):
+                    _serve_ws_channel(ws, KIND_SIGNIN)
+            except Exception as exc:  # surfaced below, not swallowed
+                errors.append(exc)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(ws.acked.wait(10), "the socket was never acknowledged")
+            with app.app_context():
+                db.session.remove()
+                self.assertEqual(
+                    db.engine.pool.checkedout(),
+                    0,
+                    "an idle WebSocket is holding a pooled database connection",
+                )
+        finally:
+            ws.released.set()
+            thread.join(timeout=10)
+        self.assertEqual(errors, [])
+
+
+class PaymentNumberClaimTests(unittest.TestCase):
+    """A user claims numbers before paying; their payments stay private."""
+
+    def setUp(self):
+        app.config["TESTING"] = True
+        with app.app_context():
+            db.drop_all()
+            db.create_all()
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+
+    def tearDown(self):
+        with app.ws_clients_lock:
+            app.ws_clients.clear()
+            app._otp_broadcast_seen = {}
+        with app.app_context():
+            db.session.remove()
+            db.drop_all()
+
+    @staticmethod
+    def _post_message(client, phone, message, sender=None):
+        payload = {"phone": phone, "message": message}
+        if sender is not None:
+            payload["sender"] = sender
+        return client.post("/api/messages", json=payload)
+
+    @staticmethod
+    def _numbers(client, token):
+        return client.get(f"/api/payment/numbers?token={token}").get_json()["numbers"]
+
+    def test_numbers_are_listed_with_their_counters(self):
+        client = app.test_client()
+        _, token = register_device("claim-buyer", ["01712340101", "01812340102"])
+
+        self.assertEqual(
+            self._numbers(client, token),
+            [
+                {"phone": "01712340101", "payment_count": 0},
+                {"phone": "01812340102", "payment_count": 0},
+            ],
+        )
+
+    def test_claiming_again_is_idempotent(self):
+        client = app.test_client()
+        _, token = register_device("idempotent-buyer", "01712340103")
+
+        response = client.post(
+            "/api/payment/numbers",
+            json={"numbers": ["+880 1712-340103"]},
+            query_string={"token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self._numbers(client, token)), 1)
+
+    def test_another_device_cannot_claim_a_number(self):
+        client = app.test_client()
+        register_device("first-owner", "01712340104")
+        _, other_token = register_device("second-buyer")
+
+        response = client.post(
+            "/api/payment/numbers",
+            json={"numbers": ["01712340104"]},
+            query_string={"token": other_token},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["numbers"], ["01712340104"])
+        self.assertEqual(self._numbers(client, other_token), [])
+
+    def test_releasing_frees_the_number_and_resets_its_counter(self):
+        client = app.test_client()
+        _, first_token = register_device("releaser", "01712340105")
+        _, second_token = register_device("next-owner")
+        self._post_message(
+            client,
+            "01712340105",
+            "Payment successful. Amount: BDT 250. TxnID: 7X9ABCDEF2",
+            sender="bKash",
+        )
+        self.assertEqual(self._numbers(client, first_token)[0]["payment_count"], 1)
+
+        released = client.delete(
+            f"/api/payment/numbers/01712340105?token={first_token}"
+        )
+        self.assertEqual(released.status_code, 200)
+        self.assertEqual(released.get_json(), {"numbers": []})
+
+        claimed = client.post(
+            "/api/payment/numbers",
+            json={"numbers": ["01712340105"]},
+            query_string={"token": second_token},
+        )
+        self.assertEqual(claimed.status_code, 200)
+        self.assertEqual(self._numbers(client, second_token)[0]["payment_count"], 0)
+
+    def test_only_the_owner_can_release(self):
+        client = app.test_client()
+        register_device("keep-owner", "01712340106")
+        _, other_token = register_device("not-owner")
+
+        response = client.delete(
+            f"/api/payment/numbers/01712340106?token={other_token}"
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_claiming_requires_an_approved_device(self):
+        client = app.test_client()
+
+        self.assertEqual(client.get("/api/payment/numbers").status_code, 401)
+        self.assertEqual(client.get("/api/payment/numbers?token=nope").status_code, 401)
+
+        with app.app_context():
+            db.session.add(
+                DeviceUser(
+                    name="pending",
+                    mac_address="MAC-pending",
+                    motherboard_serial="MB-pending",
+                    machine_guid="GUID-pending",
+                    bios_serial="BIOS-pending",
+                    ws_token="token-pending",
+                    is_active=False,
+                )
+            )
+            db.session.commit()
+
+        self.assertEqual(
+            client.get("/api/payment/numbers?token=token-pending").status_code, 403
+        )
+
+    def test_payment_reads_require_the_owner(self):
+        client = app.test_client()
+        _, token = register_device("read-owner", "01712340107")
+        _, other_token = register_device("read-other")
+        self._post_message(
+            client,
+            "01712340107",
+            "Your bKash OTP is 456789. Do not share.",
+            sender="bKash",
+        )
+
+        for path in (
+            "/api/payment/01712340107",
+            "/api/transaction/01712340107",
+            "/api/transaction/01712340107/history",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(client.get(path).status_code, 401)
+                self.assertEqual(
+                    client.get(f"{path}?token={other_token}").status_code, 403
+                )
+
+        body = client.get(f"/api/payment/01712340107?token={token}").get_json()
+        self.assertEqual(body["otp"], "456789")
+
+    def test_a_payment_is_never_pushed_to_another_device(self):
+        phone = "01712340108"
+        owner_id, _ = register_device("push-owner", phone)
+        other_id, _ = register_device("push-other")
+        owner_payment = FakeSocket()
+        owner_transaction = FakeSocket()
+        other_payment = FakeSocket()
+        other_transaction = FakeSocket()
+        register_client(owner_payment, owner_id, [phone], channel=KIND_PAYMENT)
+        register_client(
+            owner_transaction, owner_id, [phone], channel=KIND_TRANSACTION
+        )
+        register_client(other_payment, other_id, [phone], channel=KIND_PAYMENT)
+        register_client(
+            other_transaction, other_id, [phone], channel=KIND_TRANSACTION
+        )
+
+        client = app.test_client()
+        self._post_message(
+            client, phone, "Your bKash OTP is 456789. Do not share.", sender="bKash"
+        )
+
+        self.assertEqual(len(owner_payment.sent), 1)
+        self.assertEqual(owner_payment.sent[0]["otp"], "456789")
+        self.assertEqual(other_payment.sent, [])
+
+        self._post_message(
+            client,
+            phone,
+            "Payment successful. Amount: BDT 250. TxnID: 7X9ABCDEF2",
+            sender="bKash",
+        )
+
+        self.assertEqual(len(owner_transaction.sent), 1)
+        self.assertEqual(owner_transaction.sent[0]["trx"], "7X9ABCDEF2")
+        self.assertEqual(other_transaction.sent, [])
+
+    def test_an_unclaimed_number_is_pushed_to_no_device(self):
+        phone = "01712340109"
+        user_id, _ = register_device("unclaimed-user")
+        ws = FakeSocket()
+        register_client(ws, user_id, [phone], channel=KIND_PAYMENT)
+
+        self._post_message(
+            app.test_client(),
+            phone,
+            "Your bKash OTP is 111222. Do not share.",
+            sender="bKash",
+        )
+
+        self.assertEqual(ws.sent, [])
+
+    def test_payment_count_increments_once_per_new_transaction(self):
+        phone = "01712340110"
+        user_id, token = register_device("counter-owner", phone)
+        ws = FakeSocket()
+        register_client(ws, user_id, [phone], channel=KIND_TRANSACTION)
+        client = app.test_client()
+
+        first = "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1."
+        self._post_message(client, phone, first, sender="bKash")
+        self.assertEqual(ws.sent[0]["payment_count"], 1)
+
+        # A forwarder retry of the same SMS is the same payment.
+        self._post_message(client, phone, first, sender="bKash")
+        self.assertEqual(len(ws.sent), 1)
+        self.assertEqual(self._numbers(client, token)[0]["payment_count"], 1)
+
+        self._post_message(
+            client,
+            phone,
+            "Payment successful. Amount: BDT 250. TxnID: 7X9ABCDEF2",
+            sender="Nagad",
+        )
+
+        self.assertEqual(ws.sent[1]["payment_count"], 2)
+        self.assertEqual(self._numbers(client, token)[0]["payment_count"], 2)
+
+        latest = client.get(f"/api/transaction/{phone}?token={token}").get_json()
+        self.assertEqual(latest["trx"], "7X9ABCDEF2")
+        self.assertEqual(latest["payment_count"], 2)
+
+    def test_the_owner_lookup_works_without_an_app_context(self):
+        # The Redis subscriber thread calls _broadcast_otp with no app context,
+        # so the scope check must be able to open one itself.
+        owner_id, _ = register_device("owner-lookup", "01712340113")
+        from app import _payment_number_owner
+
+        self.assertEqual(_payment_number_owner("01712340113"), owner_id)
+        self.assertIsNone(_payment_number_owner("01700000000"))
+
+    def test_a_payment_otp_carries_the_count_before_that_payment(self):
+        phone = "01712340111"
+        user_id, _ = register_device("otp-count", phone)
+        ws = FakeSocket()
+        register_client(ws, user_id, [phone], channel=KIND_PAYMENT)
+        client = app.test_client()
+
+        self._post_message(
+            client, phone, "Your bKash OTP is 333444. Do not share.", sender="bKash"
+        )
+        self.assertEqual(ws.sent[0]["payment_count"], 0)
+
+        self._post_message(
+            client,
+            phone,
+            "Payment successful. Amount: BDT 100. TxnID: AAAABBBB1",
+            sender="bKash",
+        )
+        self._post_message(
+            client, phone, "Your bKash OTP is 555666. Do not share.", sender="bKash"
+        )
+        self.assertEqual(ws.sent[1]["payment_count"], 1)
+
+    def test_deleting_a_device_releases_its_numbers(self):
+        client = app.test_client()
+        owner_id, _ = register_device("deleted-owner", "01712340114")
+        _, other_token = register_device("after-delete")
+        blocked = client.post(
+            "/api/payment/numbers",
+            json={"numbers": ["01712340114"]},
+            query_string={"token": other_token},
+        )
+        self.assertEqual(blocked.status_code, 409)
+
+        with app.app_context():
+            admin = AdminUser(username="admin")
+            admin.set_password("secret")
+            db.session.add(admin)
+            db.session.commit()
+        with client.session_transaction() as session:
+            session["admin_id"] = 1
+        self.assertEqual(client.post(f"/admin/delete/{owner_id}").status_code, 302)
+
+        response = client.post(
+            "/api/payment/numbers",
+            json={"numbers": ["01712340114"]},
+            query_string={"token": other_token},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self._numbers(client, other_token)[0]["phone"], "01712340114"
+        )
+        self.assertEqual(
+            client.get(
+                "/api/payment/01712340114", query_string={"token": other_token}
+            ).status_code,
+            200,
+        )
+
+    def test_a_rotated_token_keeps_the_numbers_and_their_counter(self):
+        client = app.test_client()
+        owner_id, _ = register_device("rotate-owner", "01712340116")
+        self._post_message(
+            client,
+            "01712340116",
+            "Payment successful. Amount: BDT 250. TxnID: 8A1BCDEFG3",
+            sender="Nagad",
+        )
+
+        with app.app_context():
+            admin = AdminUser(username="admin")
+            admin.set_password("secret")
+            db.session.add(admin)
+            db.session.commit()
+        with client.session_transaction() as session:
+            session["admin_id"] = 1
+        self.assertEqual(
+            client.post(f"/admin/user/{owner_id}/regen-token").status_code, 302
+        )
+
+        with app.app_context():
+            rotated_token = db.session.get(DeviceUser, owner_id).ws_token
+        self.assertNotEqual(rotated_token, f"token-rotate-owner")
+        self.assertEqual(
+            self._numbers(client, rotated_token),
+            [{"phone": "01712340116", "payment_count": 1}],
+        )
+
+    def test_a_reissued_device_reclaims_its_numbers_by_fingerprint(self):
+        client = app.test_client()
+        phone = "01712340117"
+        fingerprint = {
+            "mac_address": "MAC-reclaim",
+            "motherboard_serial": "MB-reclaim",
+        }
+        _, first_token = register_device("reclaim-before")
+        self.assertEqual(
+            client.post(
+                "/api/payment/numbers",
+                json={"numbers": [phone], **fingerprint},
+                query_string={"token": first_token},
+            ).status_code,
+            200,
+        )
+        self._post_message(
+            client,
+            phone,
+            "Payment successful. Amount: BDT 900. TxnID: 4Z2CDEFGH5",
+            sender="bKash",
+        )
+
+        # The admin re-issued the same machine as a new row with a fresh token:
+        # its old claim must not lock it out of its own number.
+        with app.app_context():
+            reissued = DeviceUser(
+                name="reclaim-after",
+                mac_address="MAC-reclaim",
+                motherboard_serial="MB-reclaim",
+                machine_guid="",
+                bios_serial="",
+                ws_token="token-reissued",
+                is_active=True,
+            )
+            db.session.add(reissued)
+            db.session.commit()
+
+        reclaimed = client.post(
+            "/api/payment/numbers",
+            json={"numbers": [phone], **fingerprint},
+            query_string={"token": "token-reissued"},
+        )
+
+        self.assertEqual(reclaimed.status_code, 200)
+        self.assertEqual(reclaimed.get_json()["reclaimed"], [phone])
+        self.assertEqual(
+            reclaimed.get_json()["numbers"],
+            [{"phone": phone, "payment_count": 1}],
+        )
+        self.assertEqual(self._numbers(client, first_token), [])
+        self.assertEqual(
+            client.get(
+                f"/api/payment/{phone}", query_string={"token": first_token}
+            ).status_code,
+            403,
+        )
+
+    def test_a_number_claimed_without_a_fingerprint_cannot_be_taken_elsewhere(self):
+        client = app.test_client()
+        phone = "01712340118"
+        _, first_token = register_device("no-fingerprint-owner", phone)
+
+        _, other_token = register_device("figment")
+        attempt = client.post(
+            "/api/payment/numbers",
+            json={
+                "numbers": [phone],
+                "mac_address": "MAC-figment",
+                "motherboard_serial": "MB-figment",
+            },
+            query_string={"token": other_token},
+        )
+
+        # Nothing was bound to the claim, so no fingerprint can be proven and
+        # the number stays with its owner until it is released.
+        self.assertEqual(attempt.status_code, 409)
+        self.assertEqual(attempt.get_json()["numbers"], [phone])
+        self.assertEqual(self._numbers(client, first_token)[0]["phone"], phone)
+
+        # The owner itself can bind a fingerprint afterwards.
+        bound = client.post(
+            "/api/payment/numbers",
+            json={
+                "numbers": [phone],
+                "mac_address": "MAC-no-fingerprint-owner",
+                "motherboard_serial": "MB-no-fingerprint-owner",
+            },
+            query_string={"token": first_token},
+        )
+        self.assertEqual(bound.status_code, 200)
+        self.assertNotIn("reclaimed", bound.get_json())
+
+    def test_wrong_fingerprint_cannot_reclaim(self):
+        client = app.test_client()
+        phone = "01712340119"
+        _, owner_token = register_device("fp-owner")
+        client.post(
+            "/api/payment/numbers",
+            json={
+                "numbers": [phone],
+                "mac_address": "MAC-fp-owner",
+                "motherboard_serial": "MB-fp-owner",
+            },
+            query_string={"token": owner_token},
+        )
+        _, stranger_token = register_device("fp-stranger")
+
+        attempt = client.post(
+            "/api/payment/numbers",
+            json={
+                "numbers": [phone],
+                "mac_address": "MAC-fp-stranger",
+                "motherboard_serial": "MB-fp-stranger",
+            },
+            query_string={"token": stranger_token},
+        )
+
+        self.assertEqual(attempt.status_code, 409)
+        self.assertEqual(self._numbers(client, owner_token)[0]["phone"], phone)
+
+    def test_the_signin_channel_is_still_unscoped(self):
+        phone = "01712340112"
+        user_id, _ = register_device("signin-user")
+        ws = FakeSocket()
+        register_client(ws, user_id, [phone], channel=KIND_SIGNIN)
+        client = app.test_client()
+
+        self._post_message(client, phone, "Your IVAC verification code is 778899")
+
+        self.assertEqual(len(ws.sent), 1)
+        self.assertEqual(ws.sent[0]["otp"], "778899")
+        self.assertEqual(
+            client.get(f"/api/signin/{phone}").get_json()["otp"], "778899"
         )
 
 

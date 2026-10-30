@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from functools import wraps
 from flask import (
     Flask,
     flash,
+    has_app_context,
     jsonify,
     redirect,
     render_template,
@@ -28,6 +30,7 @@ from models import (
     AdminUser,
     DeviceUser,
     OTPMessage,
+    PaymentNumber,
     PaymentTransaction,
     db,
     generate_ws_token,
@@ -113,6 +116,27 @@ def _find_user_by_signatures(mac, mb, guid, bios):
 
     candidates = DeviceUser.query.filter(or_(*clauses)).all()
     return match_signatures(candidates, mac, mb, guid, bios)
+
+
+def _device_fingerprint(mac, mb, guid, bios):
+    """A stable digest of the signature fields a claimed number is bound to.
+
+    Empty when fewer than MIN_SIGNATURE_FIELDS were given: the number then stays
+    bound to its device row, and reclaiming it means releasing it first.
+    """
+    provided = [
+        f"{name}={value}"
+        for name, value in (
+            ("mac", mac),
+            ("mb", mb),
+            ("guid", guid),
+            ("bios", bios),
+        )
+        if value
+    ]
+    if len(provided) < MIN_SIGNATURE_FIELDS:
+        return ""
+    return hashlib.sha256("\n".join(provided).encode()).hexdigest()
 
 
 def normalize_bd_phone(value):
@@ -201,12 +225,18 @@ def _format_bdt(dt=None):
     return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+06:00"
 
 
-def _channel_payload(kind, phone, code, sender, sender_number, last_updated, amount=""):
+def _channel_payload(
+    kind, phone, code, sender, sender_number, last_updated, amount="", payment_count=0
+):
     """The body every channel shares.
 
     `phone` sits beside `receiver` because the original client reads `phone`;
     a transaction frame has no `otp` at all, so a payment amount can never be
     mistaken for a code by a consumer that only looks for `otp`.
+
+    `payment_count` is the number's completed-payment counter: for a
+    transaction it already includes this payment, for the payment OTP it is how
+    many had completed when the OTP arrived.
     """
     payload = {
         "kind": kind,
@@ -220,8 +250,11 @@ def _channel_payload(kind, phone, code, sender, sender_number, last_updated, amo
         payload["trx"] = code
         if amount:
             payload["amount"] = amount
+        payload["payment_count"] = payment_count
     else:
         payload["otp"] = code
+        if kind == KIND_PAYMENT:
+            payload["payment_count"] = payment_count
     return payload
 
 
@@ -258,6 +291,7 @@ def _otp_row_payload(row):
         sender_number=row.sender_number or "",
         last_updated=_format_bdt(row.updated_at),
         amount=row.amount or "",
+        payment_count=row.payment_count or 0,
     )
 
 
@@ -271,6 +305,7 @@ OTP_MIGRATION_COLUMNS = (
     "sender_number",
     "code",
     "amount",
+    "payment_count",
     "created_at",
     "updated_at",
     "revision",
@@ -285,6 +320,7 @@ _OTP_REBUILD_COALESCE = {
     "sender_number": "''",
     "code": "''",
     "amount": "''",
+    "payment_count": "0",
     "otp_message": "''",
     "revision": "id",
 }
@@ -348,6 +384,7 @@ def _rebuild_otp_message_for_composite_key(conn, columns):
                 sender_number VARCHAR(32) NOT NULL DEFAULT '',
                 code VARCHAR(32) NOT NULL DEFAULT '',
                 amount VARCHAR(20) NOT NULL DEFAULT '',
+                payment_count INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME,
                 updated_at DATETIME,
                 revision BIGINT NOT NULL DEFAULT 0,
@@ -412,6 +449,7 @@ def ensure_schema_columns():
                 ("sender_number", "VARCHAR(32) NOT NULL DEFAULT ''"),
                 ("code", "VARCHAR(32) NOT NULL DEFAULT ''"),
                 ("amount", "VARCHAR(20) NOT NULL DEFAULT ''"),
+                ("payment_count", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     conn.execute(
@@ -509,6 +547,17 @@ def ensure_schema_columns():
                     text("ALTER TABLE device_user ADD COLUMN ws_token VARCHAR(64)")
                 )
 
+    if "payment_number" in tables:
+        cols = {c["name"] for c in insp.get_columns("payment_number")}
+        if "owner_fingerprint" not in cols:
+            with db.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "ALTER TABLE payment_number ADD COLUMN "
+                        "owner_fingerprint VARCHAR(64) NOT NULL DEFAULT ''"
+                    )
+                )
+
 
 def backfill_missing_ws_tokens():
     users = DeviceUser.query.filter(
@@ -553,6 +602,37 @@ def _unregister_ws(connection_id, expected_ws=None, close_reason=1000, close_mes
     return client_data
 
 
+def _payment_number_owner(phone):
+    """The device that claimed a payment number, or None when nobody has.
+
+    Called from a request thread and the DB poller (both already have an app
+    context) and from the Redis subscriber (which does not), so a missing
+    context is created here and its session released again.
+    """
+
+    def read_owner():
+        return db.session.execute(
+            text("SELECT user_id FROM payment_number WHERE phone = :phone"),
+            {"phone": phone},
+        ).scalar()
+
+    try:
+        if has_app_context():
+            return read_owner()
+        with app.app_context():
+            try:
+                return read_owner()
+            finally:
+                db.session.remove()
+    except Exception:
+        # Delivery must not die on a lookup failure. Returning None fails closed:
+        # only the unrestricted server-wide token still receives the frame.
+        logging.getLogger(__name__).exception(
+            "Could not resolve the owner of payment number %s", phone
+        )
+        return None
+
+
 def _broadcast_otp(payload: dict):
     # Deduplicate the same arrival reaching this worker twice: the local
     # publish plus its Redis echo, or the poller re-reading a row this
@@ -587,6 +667,12 @@ def _broadcast_otp(payload: dict):
     with app.ws_clients_lock:
         clients = list(app.ws_clients.items())
 
+    # Payment numbers are claimed up front (POST /api/payment/numbers), which is
+    # what keeps two users on one SMS server from seeing each other's payments:
+    # an arrival is only ever pushed to the device that claimed the number.
+    scoped_to_owner = kind in (KIND_PAYMENT, KIND_TRANSACTION)
+    owner_user_id = _payment_number_owner(phone) if scoped_to_owner else None
+
     delivered = 0
     dead = []
     for connection_id, client_data in clients:
@@ -595,6 +681,14 @@ def _broadcast_otp(payload: dict):
         # One connection belongs to one channel: a client subscribed to the
         # sign-in socket must never see a payment OTP for the same number.
         if client_data.get("channel", KIND_SIGNIN) != kind:
+            continue
+        # A server-wide token has no user and is internal tooling, so it stays
+        # unrestricted; a device only ever sees its own claimed numbers.
+        if (
+            scoped_to_owner
+            and client_data.get("user_id") is not None
+            and client_data["user_id"] != owner_user_id
+        ):
             continue
         ws_msg = legacy_msg if client_data.get("legacy") else full_msg
         try:
@@ -648,6 +742,36 @@ def _next_otp_revision():
     return db.session.execute(
         text("SELECT value FROM otp_revision WHERE id = 1")
     ).scalar()
+
+
+def _current_payment_count(phone):
+    """Payments this number has already completed, 0 when it is unclaimed."""
+    return (
+        db.session.execute(
+            text("SELECT payment_count FROM payment_number WHERE phone = :phone"),
+            {"phone": phone},
+        ).scalar()
+        or 0
+    )
+
+
+def _bump_payment_count(phone, moment):
+    """Count one completed payment for a claimed number.
+
+    Returns the new count, or 0 when the number was never claimed: the message is
+    still stored for inspection, it simply belongs to no user yet.
+    """
+    updated = db.session.execute(
+        text(
+            "UPDATE payment_number "
+            "SET payment_count = payment_count + 1, updated_at = :now "
+            "WHERE phone = :phone"
+        ),
+        {"phone": phone, "now": moment},
+    )
+    if not updated.rowcount:
+        return 0
+    return _current_payment_count(phone)
 
 
 def _poll_otps_from_db(stop_event, interval=0.5):
@@ -1053,61 +1177,38 @@ def api_add_message():
     if not data:
         return jsonify({"error": "Invalid payload"}), 400
 
-    phone = normalize_bd_phone(data.get("phone"))
+    # The forwarder posts the two numbers it saw: the receiving SIM as
+    # `receiver` and the SMS sender address as `sender`. `phone` is the older
+    # name for the receiver, kept so existing forwarders keep working.
+    phone = normalize_bd_phone(
+        data.get("receiver") or data.get("phone") or data.get("to")
+    )
     message = data.get("message")
     if not phone or not message:
         return jsonify({"error": "Missing phone or message"}), 400
 
     message = str(message)[:199]
+    # The sender stays raw here: sms_parser resolves a shortcode (16216, 16247,
+    # 16167) or a brand name to a label and reports the address as
+    # `sender_number`.
     raw_sender = data.get("sender")
-    sender = raw_sender.strip() if isinstance(raw_sender, str) else ""
+    if not (isinstance(raw_sender, str) and raw_sender.strip()):
+        raw_sender = data.get("sender_number") or data.get("from") or ""
+    sender = str(raw_sender).strip()
 
     # The body decides the channel. The sender only labels it and resolves
     # messages whose body omits the brand, so IVAC changing its sender number
     # cannot reroute its OTPs.
     parsed = parse_sms(message, sender=sender)
 
-    # One row per phone *per kind*: a new OTP overwrites the previous OTP of
-    # the same kind and leaves the other channels' rows alone.
     now = datetime.utcnow()
-    revision = _next_otp_revision()
-    db.session.execute(
-        text(
-            """
-            INSERT INTO otp_message
-                (phone, kind, otp_message, message_pub, sender, sender_number,
-                 code, amount, created_at, updated_at, revision)
-            VALUES (:phone, :kind, :message, :pub, :sender, :sender_number,
-                    :code, :amount, :now, :now, :revision)
-            ON CONFLICT (phone, kind) DO UPDATE SET
-                otp_message = excluded.otp_message,
-                message_pub = excluded.message_pub,
-                sender = excluded.sender,
-                sender_number = excluded.sender_number,
-                code = excluded.code,
-                amount = excluded.amount,
-                updated_at = excluded.updated_at,
-                revision = excluded.revision
-            """
-        ),
-        {
-            "phone": phone,
-            "kind": parsed.kind,
-            "message": message,
-            "pub": (parsed.sender or DEFAULT_MESSAGE_PUB)[:16],
-            "sender": parsed.sender[:64],
-            "sender_number": parsed.sender_number[:32],
-            "code": parsed.code[:32],
-            "amount": parsed.amount[:20],
-            "now": now,
-            "revision": revision,
-        },
-    )
 
+    # A completed payment counts once per TRX ID. `otp_message` keeps only the
+    # latest transaction so the delivery poller has one row to follow; the
+    # history table keeps every TRX ID, and its unique key is what makes a
+    # forwarder retry the same payment rather than a new one.
     if parsed.kind == KIND_TRANSACTION:
-        # The row above only keeps the latest transaction for delivery; this
-        # table keeps every TRX ID, and a retried POST cannot duplicate one.
-        db.session.execute(
+        inserted = db.session.execute(
             text(
                 """
                 INSERT INTO payment_transaction
@@ -1128,6 +1229,65 @@ def api_add_message():
                 "now": now,
             },
         )
+        if not inserted.rowcount:
+            # Already recorded. Do not bump the counter, do not move the row's
+            # revision (the poller would re-deliver it to other workers) and do
+            # not push a second frame, so one payment is never seen twice.
+            db.session.commit()
+            return (
+                jsonify(
+                    {
+                        "success": True,
+                        "message": "Payment already recorded",
+                        "routed": parsed.kind,
+                        "duplicate": True,
+                    }
+                ),
+                201,
+            )
+        payment_count = _bump_payment_count(phone, now)
+    elif parsed.kind == KIND_PAYMENT:
+        payment_count = _current_payment_count(phone)
+    else:
+        payment_count = 0
+
+    # One row per phone *per kind*: a new OTP overwrites the previous OTP of
+    # the same kind and leaves the other channels' rows alone.
+    revision = _next_otp_revision()
+    db.session.execute(
+        text(
+            """
+            INSERT INTO otp_message
+                (phone, kind, otp_message, message_pub, sender, sender_number,
+                 code, amount, payment_count, created_at, updated_at, revision)
+            VALUES (:phone, :kind, :message, :pub, :sender, :sender_number,
+                    :code, :amount, :payment_count, :now, :now, :revision)
+            ON CONFLICT (phone, kind) DO UPDATE SET
+                otp_message = excluded.otp_message,
+                message_pub = excluded.message_pub,
+                sender = excluded.sender,
+                sender_number = excluded.sender_number,
+                code = excluded.code,
+                amount = excluded.amount,
+                payment_count = excluded.payment_count,
+                updated_at = excluded.updated_at,
+                revision = excluded.revision
+            """
+        ),
+        {
+            "phone": phone,
+            "kind": parsed.kind,
+            "message": message,
+            "pub": (parsed.sender or DEFAULT_MESSAGE_PUB)[:16],
+            "sender": parsed.sender[:64],
+            "sender_number": parsed.sender_number[:32],
+            "code": parsed.code[:32],
+            "amount": parsed.amount[:20],
+            "payment_count": payment_count,
+            "now": now,
+            "revision": revision,
+        },
+    )
 
     db.session.commit()
 
@@ -1141,6 +1301,7 @@ def api_add_message():
                 sender_number=parsed.sender_number,
                 last_updated=_format_bdt(now),
                 amount=parsed.amount,
+                payment_count=payment_count,
             )
         )
 
@@ -1175,7 +1336,99 @@ def _latest_row(phone, kind):
     )
 
 
+def _request_identity():
+    """(user_id, unrestricted, error) for an HTTP caller's device token.
+
+    A client's `ws_token` authenticates its HTTP reads too, so a payment number
+    is readable only by the device that claimed it. The server-wide
+    WS_AUTH_TOKEN stays unrestricted: it is an internal/admin credential, not a
+    user's.
+    """
+    token = (request.args.get("token") or "").strip()
+    if not token:
+        token = (request.headers.get("X-WS-Token") or "").strip()
+    if not token:
+        authorization = request.headers.get("Authorization") or ""
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+    if not token:
+        return None, False, "missing"
+
+    user = DeviceUser.query.filter_by(ws_token=token).first()
+    if user is not None:
+        if user.is_expired:
+            user.is_active = False
+            db.session.commit()
+            return None, False, "expired"
+        if not user.is_active:
+            return None, False, "inactive"
+        return user.id, False, None
+
+    global_token = app.config.get("WS_AUTH_TOKEN")
+    if global_token and token == global_token:
+        return None, True, None
+    return None, False, "invalid"
+
+
+def _identity_error_response(error):
+    if error == "expired":
+        return jsonify({"error": "Access expired", "status": "expired"}), 403
+    if error == "inactive":
+        return (
+            jsonify({"error": "Account pending admin approval", "status": "inactive"}),
+            403,
+        )
+    return jsonify({"error": "Unauthorized"}), 401
+
+
+def _claimed_number_owner(phone):
+    return db.session.execute(
+        text("SELECT user_id FROM payment_number WHERE phone = :phone"),
+        {"phone": normalize_bd_phone(phone)},
+    ).scalar()
+
+
+def _authorize_channel_read(phone, kind):
+    """None when this caller may read `kind` for this number, else a response.
+
+    Sign-in keeps its original open contract; payment and transaction numbers are
+    private to the device that claimed them.
+    """
+    if kind not in (KIND_PAYMENT, KIND_TRANSACTION):
+        return None
+
+    user_id, unrestricted, error = _request_identity()
+    if error:
+        return _identity_error_response(error)
+    if unrestricted:
+        return None
+
+    owner_id = _claimed_number_owner(phone)
+    if owner_id is None or owner_id != user_id:
+        # The same answer whether the number is unclaimed or belongs to someone
+        # else, so a probe cannot learn which numbers are in use.
+        return jsonify({"error": "Number is not registered to this user"}), 403
+    return None
+
+
+def _payment_number_payload(user_id):
+    rows = (
+        PaymentNumber.query.filter_by(user_id=user_id)
+        .order_by(PaymentNumber.id.asc())
+        .all()
+    )
+    return {
+        "numbers": [
+            {"phone": row.phone, "payment_count": row.payment_count or 0}
+            for row in rows
+        ]
+    }
+
+
 def _channel_response(phone, kind):
+    denial = _authorize_channel_read(phone, kind)
+    if denial:
+        return denial
     payload = _otp_row_payload(_latest_row(phone, kind))
     if not payload:
         return jsonify({}), 200
@@ -1197,6 +1450,132 @@ def api_get_messages(phone):
         ),
         200,
     )
+
+
+@app.route("/api/payment/numbers", methods=["GET", "POST"], strict_slashes=False)
+def api_payment_numbers():
+    """Claim the numbers this device will pay from, and report their counters.
+
+    Declaring them up front is what scopes payment OTPs and transactions to one
+    user: an arrival for a claimed number reaches only its owner's sockets and
+    HTTP reads. Posting the same numbers again is a no-op, so a client can call
+    this before every payment run without losing counts.
+    """
+    user_id, unrestricted, error = _request_identity()
+    if error:
+        return _identity_error_response(error)
+    if unrestricted:
+        # The server-wide token is internal tooling and owns no numbers.
+        return jsonify({"error": "A device token is required"}), 403
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        raw_numbers = data.get("numbers")
+        if not isinstance(raw_numbers, list) or not raw_numbers:
+            return jsonify({"error": "numbers must be a non-empty array"}), 400
+
+        requested = []
+        for raw_number in raw_numbers:
+            if not isinstance(raw_number, str):
+                return jsonify({"error": "Each number must be a string"}), 400
+            phone = normalize_bd_phone(raw_number)
+            if not phone:
+                return jsonify({"error": "Each number must contain digits"}), 400
+            if phone not in requested:
+                requested.append(phone)
+
+        claimed = {
+            row.phone: row
+            for row in PaymentNumber.query.filter(
+                PaymentNumber.phone.in_(requested)
+            ).all()
+        }
+        fingerprint = _device_fingerprint(*_normalize_device_signatures(data)[:4])
+        conflicts = sorted(
+            phone for phone, row in claimed.items() if row.user_id != user_id
+        )
+
+        # A rotated token can leave a device holding a *new* user row for the
+        # same machine, and its own earlier claim would then lock it out with a
+        # 409. Ownership is checked against the machine as well: the claim
+        # remembered the fingerprint that made it, so a caller that re-proves it
+        # takes the number back with its counter intact. A different fingerprint
+        # still gets the 409 — this is an ownership check, not a takeover.
+        reclaimed = []
+        now = datetime.utcnow()
+        for phone in list(conflicts):
+            row = claimed[phone]
+            holder = db.session.get(DeviceUser, row.user_id)
+            same_machine = bool(fingerprint) and row.owner_fingerprint == fingerprint
+            # holder is None only for a claim left behind by a device row that
+            # vanished without it (an older build): nobody owns it any more.
+            if same_machine or holder is None:
+                row.user_id = user_id
+                row.owner_fingerprint = fingerprint
+                row.updated_at = now
+                conflicts.remove(phone)
+                reclaimed.append(phone)
+
+        if conflicts:
+            return (
+                jsonify({"error": "Number already registered", "numbers": conflicts}),
+                409,
+            )
+
+        for phone in requested:
+            if phone not in claimed:
+                db.session.add(
+                    PaymentNumber(
+                        user_id=user_id,
+                        phone=phone,
+                        payment_count=0,
+                        owner_fingerprint=fingerprint,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            elif not claimed[phone].owner_fingerprint and fingerprint:
+                # Bind a number claimed before this check existed, so a later
+                # rotation can still reclaim it.
+                claimed[phone].owner_fingerprint = fingerprint
+                claimed[phone].updated_at = now
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # Another worker claimed one of these between the check and the
+            # insert; report it the same way as a plain conflict.
+            db.session.rollback()
+            return jsonify({"error": "Number already registered"}), 409
+
+        payload = _payment_number_payload(user_id)
+        if reclaimed:
+            payload["reclaimed"] = sorted(reclaimed)
+        return jsonify(payload), 200
+
+    return jsonify(_payment_number_payload(user_id)), 200
+
+
+@app.route("/api/payment/numbers/<phone>", methods=["DELETE"], strict_slashes=False)
+def api_payment_number_release(phone):
+    """Give a number back, so another device can claim it later.
+
+    Releasing drops the number's counter: the next owner starts from zero.
+    """
+    user_id, unrestricted, error = _request_identity()
+    if error:
+        return _identity_error_response(error)
+    if unrestricted:
+        return jsonify({"error": "A device token is required"}), 403
+
+    row = PaymentNumber.query.filter_by(
+        user_id=user_id, phone=normalize_bd_phone(phone)
+    ).first()
+    if row is None:
+        return jsonify({"error": "Number is not registered to this user"}), 404
+
+    db.session.delete(row)
+    db.session.commit()
+    return jsonify(_payment_number_payload(user_id)), 200
 
 
 @app.route("/api/signin/<phone>", methods=["GET"], strict_slashes=False)
@@ -1226,6 +1605,10 @@ def _trx_history_retention_days():
 
 @app.route("/api/transaction/<phone>/history", methods=["GET"], strict_slashes=False)
 def api_transaction_history(phone):
+    denial = _authorize_channel_read(phone, KIND_TRANSACTION)
+    if denial:
+        return denial
+
     try:
         limit = max(1, min(int(request.args.get("limit", "50")), 200))
     except (TypeError, ValueError):
@@ -1304,6 +1687,14 @@ def _serve_ws_channel(ws, channel, legacy=False):
     user_id, ok = _ws_identity(ws)
     if not ok:
         return
+    # A WebSocket handler's app context lives as long as the connection, so its
+    # session would keep one pooled database connection checked out for the whole
+    # socket — and the default pool is only 5 + 10 overflow, so a worker would
+    # cap at ~15 sockets no matter how many threads it has: the 16th waits
+    # pool_timeout (30s) and then fails its upgrade. Nothing below the identity
+    # check touches the database, so hand the connection back before the idle
+    # receive loop begins.
+    db.session.remove()
     _serve_ws_connection(ws, user_id, channel=channel, legacy=legacy)
 
 
@@ -1463,6 +1854,9 @@ def delete_user(user_id):
     user = DeviceUser.query.get_or_404(user_id)
     display = user.name or "Unnamed"
     _drop_user_ws(user.id)
+    # The device's claimed numbers go with it. Without this they would stay
+    # locked to a user that no longer exists and nobody could claim them again.
+    PaymentNumber.query.filter_by(user_id=user.id).delete()
     db.session.delete(user)
     db.session.commit()
     flash(f"User {display} deleted.", "danger")

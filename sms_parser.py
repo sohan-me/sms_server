@@ -64,10 +64,17 @@ _DIGIT_GROUP_SPLIT_RE = re.compile(r"[" + _SEPARATOR_CHARS + r"]+")
 _CONTIGUOUS_RE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
 _TRX_TOKEN_RE = re.compile(r"[A-Za-z0-9]{6,20}")
 _AMOUNT_RE = re.compile(
-    r"(?:(?:bdt|tk|taka|৳)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+    # "Tk.3,000.00" and "Tk 3,000.00" are the same amount: bKash writes the
+    # dot, and a literal "\s*" after the currency would miss every one of them.
+    r"(?:(?:bdt|tk|taka|৳)\.?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
     r"|([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:bdt|tk|taka|৳))",
     re.IGNORECASE,
 )
+# The clause a security warning runs to (end of sentence/line).
+_WARNING_END_RE = re.compile(r"[.!?\n]")
+# How close a code must sit to a warning-covered OTP keyword before it counts as
+# that keyword's code ("Do not share your OTP 123456 with anyone").
+_OTP_WARNING_WINDOW = 24
 
 
 @dataclass(frozen=True)
@@ -317,6 +324,55 @@ def _first_keyword(lower_text: str, patterns: Iterable["re.Pattern"]) -> Optiona
     return earliest
 
 
+def _warning_spans(lower_text: str, patterns: SmsPatterns) -> List[Tuple[int, int]]:
+    """The security-warning clauses ("do not share your OTP ...") in a body.
+
+    Every provider prefixes an OTP with one, and the wallets also put the same
+    line on a completed-transaction SMS. Reading the keyword inside it as an
+    OTP announcement is what made "Never share your OTP ... TrxID 9HAB ...
+    Balance Tk 1500" a payment OTP of 1500 instead of a transaction.
+    """
+    spans = []
+    for pattern in patterns.keywords.get("warning", ()):
+        for match in pattern.finditer(lower_text):
+            end_match = _WARNING_END_RE.search(lower_text, match.end())
+            end = end_match.start() + 1 if end_match else len(lower_text)
+            spans.append((match.start(), end))
+    return spans
+
+
+def _otp_anchor(lower_text: str, patterns: SmsPatterns) -> Optional[Tuple[int, int]]:
+    """The OTP keyword a message announces its code with, not a warning.
+
+    A warning is still the only keyword when a template puts the code in the
+    warning itself, so that case survives — but only when a code sits within a
+    few characters of it.
+    """
+    spans = _warning_spans(lower_text, patterns)
+
+    def in_warning(position: int) -> bool:
+        return any(start <= position < end for start, end in spans)
+
+    primary = None
+    fallback = None
+    for pattern in patterns.keywords.get("otp", ()):
+        for match in pattern.finditer(lower_text):
+            span = (match.start(), match.end())
+            if in_warning(match.start()):
+                if fallback is None or span[0] < fallback[0]:
+                    fallback = span
+            elif primary is None or span[0] < primary[0]:
+                primary = span
+
+    if primary:
+        return primary
+    if fallback and _CONTIGUOUS_RE.search(
+        lower_text, fallback[1], fallback[1] + _OTP_WARNING_WINDOW
+    ):
+        return fallback
+    return None
+
+
 def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
     """The OTP from a message, in digits, or ``""``.
 
@@ -336,7 +392,7 @@ def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
     if separated:
         return separated
 
-    anchor = _first_keyword(lower, patterns.keywords.get("otp", ()))
+    anchor = _otp_anchor(lower, patterns)
     if anchor:
         block = _contiguous_block(text, start=anchor[1])
         if block:
@@ -375,26 +431,65 @@ def extract_amount(message) -> str:
         return ""
 
 
-def _detect_brand(lower_text: str, patterns: SmsPatterns) -> Optional[Brand]:
-    if not lower_text:
+def _detect_brand(
+    text: str,
+    patterns: SmsPatterns,
+    anchor: Optional[Tuple[int, int]] = None,
+) -> Optional[Brand]:
+    """The brand a message is about, or ``None``.
+
+    ``anchor`` is the OTP keyword's span. With it, the brand *nearest the
+    keyword* wins instead of the first one listed: a payment OTP names its
+    merchant too ("Your bKash OTP for PAYMENT of Tk 3,000.00 to IVAC ..."),
+    and only proximity tells the wallet apart from the payee.
+    """
+    if not text:
         return None
-    for brand in patterns.brands:
-        if brand.pattern.search(lower_text):
+
+    best: Optional[Tuple[Tuple[int, int], Brand]] = None
+    for index, brand in enumerate(patterns.brands):
+        match = brand.pattern.search(text)
+        if match is None:
+            continue
+        if anchor is None:
+            # Nothing to measure against, so the listed order decides.
             return brand
-    return None
+        if match.end() <= anchor[0]:
+            distance = anchor[0] - match.end()
+        elif match.start() >= anchor[1]:
+            distance = match.start() - anchor[1]
+        else:
+            distance = 0
+        key = (distance, index)
+        if best is None or key < best[0]:
+            best = (key, brand)
+    return best[1] if best else None
+
+
+def _sender_digits(value) -> str:
+    """A sender address's digits, with country code and leading zero removed.
+
+    One forwarder reports a shortcode as ``16216``, another as ``+880 16216``;
+    the senders map has to treat those as the same address.
+    """
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("880") and len(digits) > 6:
+        digits = digits[3:]
+    return digits.lstrip("0")
 
 
 def _lookup_sender(raw_sender: str, patterns: SmsPatterns) -> Optional[Dict[str, str]]:
+    """The brand a sender address belongs to (wallet shortcode, IVAC id, ...)."""
     if not raw_sender:
         return None
     key = raw_sender.strip().upper()
     if key in patterns.senders:
         return patterns.senders[key]
 
-    digits = re.sub(r"\D", "", raw_sender)
+    digits = _sender_digits(raw_sender)
     if digits:
         for address, meta in patterns.senders.items():
-            if re.sub(r"\D", "", address) == digits:
+            if _sender_digits(address) == digits:
                 return meta
     return None
 
@@ -415,7 +510,9 @@ def parse_sms(
     lower = text.lower()
     raw_sender = str(sender or "").strip()
 
-    body_brand = _detect_brand(lower, patterns)
+    otp_keyword = _otp_anchor(lower, patterns)
+
+    body_brand = _detect_brand(lower, patterns, anchor=otp_keyword)
     mapped_sender = _lookup_sender(raw_sender, patterns)
     sender_brand = _detect_brand(raw_sender.lower(), patterns)
 
@@ -432,7 +529,6 @@ def parse_sms(
     trx = extract_trx_id(text, patterns)
     amount = extract_amount(text)
 
-    otp_keyword = _first_keyword(lower, patterns.keywords.get("otp", ()))
     signin_keyword = _first_keyword(lower, patterns.keywords.get("signin", ()))
 
     kind = KIND_UNKNOWN
@@ -441,6 +537,18 @@ def parse_sms(
     if otp and otp_keyword:
         if family == KIND_PAYMENT:
             kind, reason = KIND_PAYMENT, "payment OTP (brand or sender says payment)"
+        elif (
+            family == KIND_SIGNIN
+            and mapped_sender
+            and mapped_sender["family"] == KIND_PAYMENT
+            and _first_keyword(lower, patterns.keywords.get("payment", ()))
+        ):
+            # A wallet message can name only its payee: "Your OTP for PAYMENT of
+            # Tk.3,000.00 to IVAC (DGePay) is 319805" is bKash's payment OTP, and
+            # the only brand in the body belongs to the merchant. The forwarder's
+            # sender number is what says which wallet actually sent it.
+            family, sender_label = KIND_PAYMENT, mapped_sender["label"]
+            kind, reason = KIND_PAYMENT, "payment OTP (sender says payment, body names only the payee)"
         elif family == KIND_SIGNIN:
             kind, reason = KIND_SIGNIN, "sign-in OTP (brand or sender says sign-in)"
         elif signin_keyword:

@@ -151,6 +151,9 @@ class AmountExtractionTests(unittest.TestCase):
             ("Amount: BDT 250", "250.00"),
             ("Your new balance is Tk 1500", "1500.00"),
             ("Paid ৳ 300.00", "300.00"),
+            # bKash writes the currency dot before the amount.
+            ("Your bKash OTP for PAYMENT of Tk.3,000.00 to IVAC is 319805", "3000.00"),
+            ("Payment of Tk. 1,234.50 to DGEPAY is successful", "1234.50"),
         )
         for body, expected in cases:
             with self.subTest(body=body):
@@ -274,7 +277,9 @@ class ClassificationTests(unittest.TestCase):
         self.assertTrue(parsed.reason)
 
     def test_otp_without_a_brand_or_mapped_sender_is_unknown(self):
-        parsed = parse_sms("Your OTP is 123456", sender="16247", patterns=PATTERNS)
+        # An unmapped gateway number: 16247/16216/16167 are the wallet
+        # shortcodes and would resolve the channel on their own.
+        parsed = parse_sms("Your OTP is 123456", sender="09611123456", patterns=PATTERNS)
         self.assertEqual(parsed.kind, KIND_UNKNOWN)
         self.assertIn("brand", parsed.reason)
 
@@ -313,6 +318,213 @@ class ClassificationTests(unittest.TestCase):
         parsed = parse_sms("", patterns=PATTERNS)
         self.assertEqual(parsed.kind, KIND_UNKNOWN)
         self.assertEqual(parsed.code, "")
+
+
+class RealProviderTemplateTests(unittest.TestCase):
+    """The exact bodies the wallets and IVAC send in production."""
+
+    def test_bkash_payment_otp_names_a_merchant_and_still_routes_to_payment(self):
+        # The body says bKash *and* IVAC; IVAC is the payee, not the sender,
+        # so proximity to the OTP keyword decides the channel.
+        parsed = parse_sms(
+            "Do NOT share your OTP or PIN with anyone. Your bKash OTP for PAYMENT "
+            "of Tk.3,000.00 to IVAC (DGePay) is 319805. Expires in 2 min.",
+            sender="bKash",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "319805")
+        self.assertEqual(parsed.sender, "bKash")
+        self.assertEqual(parsed.amount, "")
+
+    def test_bkash_payment_otp_without_a_sender_hint(self):
+        parsed = parse_sms(
+            "Do NOT share your OTP or PIN with anyone. Your bKash OTP for PAYMENT "
+            "of Tk.3,000.00 to IVAC (DGePay) is 319805. Expires in 2 min.",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "319805")
+
+    def test_rocket_otp(self):
+        parsed = parse_sms(
+            "Rocket OTP:\n\nYour security code for Rocket transaction is 525926.",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "525926")
+        self.assertEqual(parsed.sender, "Rocket")
+
+    def test_rocket_transaction(self):
+        parsed = parse_sms(
+            "Tk4,500.00 paid through e-Commerce gateway. NetBal: Tk112,601.25 "
+            "TxnId: 7028086216 Date:08-OCT-26 01:31:57 pm. "
+            "Don't share your PIN with anybody",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_TRANSACTION)
+        self.assertEqual(parsed.trx, "7028086216")
+        self.assertEqual(parsed.amount, "4500.00")
+        self.assertEqual(parsed.otp, "")
+
+    def test_bkash_transaction(self):
+        parsed = parse_sms(
+            "Payment of Tk 3,000.00 to DGEPAY SERVICES LIMITED-RM62457 is "
+            "successful. Balance Tk 11,620.91. TrxID DJM4DNBFXE at 22/10/2026 14:02",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_TRANSACTION)
+        self.assertEqual(parsed.trx, "DJM4DNBFXE")
+        self.assertEqual(parsed.amount, "3000.00")
+        self.assertEqual(parsed.otp, "")
+
+    def test_nagad_otp(self):
+        parsed = parse_sms(
+            "NEVER share your OTP or PIN with anyone. Nagad will never ask for "
+            "these.\nYour OTP for Nagad ECOM payment is 035568.\n"
+            "Validity: 2 minutes.\nHelpline: 16167",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "035568")
+        self.assertEqual(parsed.sender, "Nagad")
+
+    def test_nagad_transaction(self):
+        parsed = parse_sms(
+            "Payment to 'DGePAY Services Limite' is Successful.\n"
+            "Amount: Tk 6000.0\nTxnID: 75PRV4ZK\nBalance: Tk 31840.01\n"
+            "23/07/2026 16:57",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_TRANSACTION)
+        self.assertEqual(parsed.trx, "75PRV4ZK")
+        self.assertEqual(parsed.amount, "6000.00")
+        self.assertEqual(parsed.otp, "")
+
+    def test_ivac_signin_still_wins_over_no_wallet(self):
+        parsed = parse_sms(
+            "Your IVAC verification code is ONE_TWO_THREE_FOUR_FIVE_SIX",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_SIGNIN)
+        self.assertEqual(parsed.otp, "123456")
+
+
+class ForwarderAddressTests(unittest.TestCase):
+    """The forwarder posts the SMS sender address, so it has to identify brands."""
+
+    def test_wallet_shortcodes_label_a_body_that_never_names_the_wallet(self):
+        # The Rocket transaction template has no brand in it at all.
+        cases = (
+            (
+                "16216",
+                "Rocket",
+                "Tk4,500.00 paid through e-Commerce gateway. NetBal: Tk112,601.25 "
+                "TxnId: 7028086216 Date:08-OCT-26 01:31:57 pm. "
+                "Don't share your PIN with anybody",
+                "7028086216",
+            ),
+            (
+                "16247",
+                "bKash",
+                "Payment of Tk 3,000.00 to DGEPAY SERVICES LIMITED-RM62457 is "
+                "successful. Balance Tk 11,620.91. TrxID DJM4DNBFXE at 22/10/2026 14:02",
+                "DJM4DNBFXE",
+            ),
+            (
+                "16167",
+                "Nagad",
+                "Payment to 'DGePAY Services Limite' is Successful.\n"
+                "Amount: Tk 6000.0\nTxnID: 75PRV4ZK\nBalance: Tk 31840.01\n"
+                "23/07/2026 16:57",
+                "75PRV4ZK",
+            ),
+        )
+        for sender, label, body, trx in cases:
+            with self.subTest(sender=sender):
+                parsed = parse_sms(body, sender=sender, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_TRANSACTION)
+                self.assertEqual(parsed.trx, trx)
+                self.assertEqual(parsed.sender, label)
+                self.assertEqual(parsed.sender_number, sender)
+
+    def test_a_shortcode_alone_routes_a_brandless_otp(self):
+        parsed = parse_sms(
+            "Your security code is 525926. Do not share it.",
+            sender="16216",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "525926")
+        self.assertEqual(parsed.sender, "Rocket")
+
+    def test_the_same_shortcode_with_a_country_code_or_spaces(self):
+        for sender in ("+880 16216", "88016216", " 16216 "):
+            with self.subTest(sender=sender):
+                parsed = parse_sms(
+                    "Tk 100.00 paid. TxnId: 1234567890",
+                    sender=sender,
+                    patterns=PATTERNS,
+                )
+                self.assertEqual(parsed.kind, KIND_TRANSACTION)
+                self.assertEqual(parsed.sender, "Rocket")
+
+    def test_an_otp_naming_only_its_merchant_is_the_wallets_payment_otp(self):
+        # IVAC is the payee here; the shortcode says the SMS came from bKash.
+        parsed = parse_sms(
+            "Your OTP for PAYMENT of Tk.3,000.00 to IVAC (DGePay) is 319805. "
+            "Expires in 2 min.",
+            sender="16247",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "319805")
+        self.assertEqual(parsed.sender, "bKash")
+
+    def test_an_ivac_signin_otp_is_unaffected_by_the_payee_rule(self):
+        parsed = parse_sms(
+            "Your IVAC verification code is ONE_TWO_THREE_FOUR_FIVE_SIX",
+            sender="8801999999999",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_SIGNIN)
+        self.assertEqual(parsed.otp, "123456")
+
+
+class SecurityWarningTests(unittest.TestCase):
+    """Wallets print the same "never share your OTP" line on transactions."""
+
+    def test_a_warning_does_not_turn_a_transaction_into_an_otp(self):
+        for body in (
+            "Never share your OTP with anyone. You received Tk 500.00. "
+            "TrxID 9HABCDEFG1. Balance Tk 1500",
+            "Never share your OTP with anyone. TrxID 9HABCDEFG1.",
+            "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1. "
+            "Never share your OTP or PIN with anyone.",
+        ):
+            with self.subTest(body=body):
+                parsed = parse_sms(body, sender="16247", patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_TRANSACTION)
+                self.assertEqual(parsed.trx, "9HABCDEFG1")
+                self.assertEqual(parsed.otp, "")
+
+    def test_a_code_inside_the_warning_is_still_read(self):
+        parsed = parse_sms(
+            "Do not share your OTP 445566 with anyone.",
+            sender="16247",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "445566")
+
+    def test_the_warning_does_not_win_over_the_real_otp_keyword(self):
+        parsed = parse_sms(
+            "Do NOT share your OTP or PIN with anyone. Your bKash OTP for PAYMENT "
+            "of Tk.3,000.00 to IVAC (DGePay) is 319805. Expires in 2 min.",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.kind, KIND_PAYMENT)
+        self.assertEqual(parsed.otp, "319805")
 
 
 class PatternLoadingTests(unittest.TestCase):

@@ -11,8 +11,17 @@ threads = int(os.environ.get("WEB_THREADS", 8))
 
 # CAPACITY: an open WebSocket blocks one thread for the life of the connection
 # (the handler sits in ws.receive() until the peer goes away), and those same
-# threads serve POST /api/messages. Total concurrent WebSocket connections must
-# therefore stay under workers * threads. Raise WEB_THREADS to raise the ceiling.
+# threads serve POST /api/messages. An idle socket holds no database connection —
+# the handler releases its session after the token check — so threads, not the
+# SQLAlchemy pool, are the limit.
+#
+# Size WEB_THREADS by the peak socket count, NOT workers * threads: gunicorn does
+# not spread long-lived connections evenly. Measured by opening sockets until the
+# server stopped accepting: 1x64 accepted 64; 3x16 accepted 16 (one worker took
+# every connection, the other two sat idle); 3x32 accepted 59 (27 / 16 / 16).
+# Extra workers buy ingest throughput only, so keep WEB_THREADS above the sockets
+# you expect on one worker. Budget 3 sockets per user (one per channel) plus
+# headroom: sockets that fill every thread leave none for POST /api/messages.
 #
 # "timeout" does NOT govern WebSockets. gunicorn's liveness check only touches a
 # temp file from the worker's main loop (workers/workertmp.py), which keeps

@@ -104,6 +104,13 @@ class OTPMessage(db.Model):
     # Only set for a transaction, so the latest frame can carry it without a
     # second lookup into the history table.
     amount = db.Column(db.String(20), nullable=False, default="", server_default="")
+    # The number's payment counter at the moment this row arrived: the count
+    # after the increment for a transaction, the completed-payments-so-far for a
+    # payment OTP. Stored so a worker delivering late reports the count that
+    # belonged to that payment instead of whatever the counter says now.
+    payment_count = db.Column(
+        db.Integer, nullable=False, default=0, server_default="0"
+    )
     message_pub = db.Column(
         db.String(16),
         nullable=False,
@@ -142,6 +149,37 @@ class PaymentTransaction(db.Model):
     )
     raw_message = db.Column(db.String(200), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class PaymentNumber(db.Model):
+    """A payment number (or account) claimed by one device.
+
+    Users declare the numbers they will pay from *before* paying, so the server
+    can keep one user's payment OTPs and transactions off another user's sockets
+    and HTTP reads. `payment_count` is how many payments this number has
+    completed — 1 for the first file paid, 2 for the second with the same number.
+    """
+
+    __tablename__ = "payment_number"
+    __table_args__ = (
+        db.UniqueConstraint("phone", name="uq_payment_number_phone"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    phone = db.Column(db.String(20), nullable=False)
+    payment_count = db.Column(
+        db.Integer, nullable=False, default=0, server_default="0"
+    )
+    # Digest of the device signature fields that claimed this number. The owner
+    # row can be reissued with a new token (or replaced outright); the machine
+    # that claimed the number is what lets it take the number back, counter and
+    # all, instead of being locked out by its own previous claim.
+    owner_fingerprint = db.Column(
+        db.String(64), nullable=False, default="", server_default=""
+    )
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 class OTPRevision(db.Model):

@@ -12,12 +12,21 @@
     "keywords.otp: a message needs one of these plus an extractable code before",
     "  it can be an OTP at all. Add wording here when a provider changes it.",
     "keywords.signin: sign-in vocabulary, used when the sender/brand is unknown.",
+    "keywords.payment: payment vocabulary. A wallet's OTP may name only the",
+    "  merchant (\"OTP for PAYMENT ... to IVAC\"), so this plus a wallet sender",
+    "  is what tells a payment OTP from a sign-in one.",
+    "keywords.warning: security-warning wording. An OTP keyword inside one of",
+    "  these clauses is not an OTP announcement — wallets print the same line on",
+    "  transaction SMS, where it would otherwise be read as the OTP.",
     "trx_anchors: the labels a transaction ID follows. The token right after the",
     "  anchor is read as the TRX ID.",
-    "senders: optional map for sender addresses that carry no brand name in the",
-    "  body, e.g. a numeric gateway number. Keys are compared case-insensitively",
-    "  and, for numeric addresses, digit for digit. Purely a hint — routing never",
-    "  depends on it, so a provider changing its sender number cannot break."
+    "senders: sender addresses (wallet shortcodes, gateway numbers) mapped to a",
+    "  brand. The forwarder posts the SMS sender address, so this is what labels",
+    "  messages whose body never names the provider — a Rocket transaction, for",
+    "  example, only says \"Tk4,500.00 paid ... TxnId:\". Keys are compared",
+    "  case-insensitively and, for numeric addresses, digit for digit after",
+    "  dropping a 880 country code. Add a new shortcode here; routing is decided",
+    "  by the body whenever the body names a brand."
   ],
   "brands": [
     {
@@ -80,6 +89,24 @@
       "signin",
       "sign-in",
       "appointment"
+    ],
+    "payment": [
+      "payment",
+      "paid",
+      "purchase",
+      "e-commerce",
+      "ecommerce",
+      "ecom"
+    ],
+    "warning": [
+      "do not share",
+      "don't share",
+      "dont share",
+      "never share",
+      "do not disclose",
+      "never disclose",
+      "do not give",
+      "do not provide"
     ]
   },
   "trx_anchors": [
@@ -96,5 +123,9 @@
     "trx",
     "txn"
   ],
-  "senders": {}
+  "senders": {
+    "16216": { "label": "Rocket", "family": "payment" },
+    "16247": { "label": "bKash", "family": "payment" },
+    "16167": { "label": "Nagad", "family": "payment" }
+  }
 }
