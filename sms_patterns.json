@@ -79,16 +79,35 @@
       "login code",
       "your code",
       "code is",
-      "code:"
+      "code:",
+      "following sequence",
+      "sequence when prompted",
+      "type the following sequence",
+      "type the sequence",
+      "sequence is",
+      "sequence:",
+      "security sequence",
+      "pin",
+      "pin is",
+      "pin:",
+      "password",
+      "password is",
+      "password:",
+      "passcode",
+      "passcode is",
+      "passcode:"
     ],
     "signin": [
       "ivac",
+      "ivacbd",
       "login",
       "log in",
       "sign in",
       "signin",
       "sign-in",
-      "appointment"
+      "appointment",
+      "following sequence",
+      "when prompted"
     ],
     "payment": [
       "payment",
@@ -126,6 +145,8 @@
   "senders": {
     "16216": { "label": "Rocket", "family": "payment" },
     "16247": { "label": "bKash", "family": "payment" },
-    "16167": { "label": "Nagad", "family": "payment" }
+    "16167": { "label": "Nagad", "family": "payment" },
+    "IVACBD": { "label": "IVAC", "family": "signin" },
+    "IVAC": { "label": "IVAC", "family": "signin" }
   }
 }

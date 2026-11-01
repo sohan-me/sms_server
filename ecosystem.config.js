@@ -38,14 +38,20 @@ module.exports = {
         // Capacity rule: every open WebSocket permanently occupies one thread
         // (an idle socket holds no database connection). Size WEB_THREADS by the
         // peak socket count, not workers * threads — gunicorn does not spread
-        // long-lived connections evenly, so 4 * 16 does NOT mean 64 sockets:
+        // long-lived connections evenly, so 4 * 20 does NOT mean 80 sockets:
         // measured, 3 workers x 16 threads stalled at 16 sockets because one
-        // worker absorbed every connection. Budget 3 sockets per user (signin,
-        // payment, transaction) plus headroom for POST /api/messages — so 16 here
-        // serves ~4-5 concurrent users, not 21. Extra workers buy ingest
-        // throughput only; raise WEB_THREADS for more users.
+        // worker absorbed every connection.
+        //
+        // Target: 15 users x 3 sockets (signin, payment, transaction) = 45, plus
+        // 5 threads of headroom so ingest and /api/health still answer when one
+        // worker happens to hold every socket. Measured at 4 x 50 with all 45
+        // sockets open: health 5ms, SMS ingest 13ms, counters correct — the 45
+        // all landed on one worker, which is the case this headroom covers. Do
+        // not trim to 45: that leaves nothing to accept POST /api/messages on
+        // the worker holding the sockets, and the failure is intermittent.
+        // 4 workers x 50 threads = 200 threads; stack memory stays small.
         WEB_CONCURRENCY: "4",
-        WEB_THREADS: "16",
+        WEB_THREADS: "50",
 
         // Server-side WebSocket ping; reaps clients killed by nginx or a NAT
         // timeout instead of leaking their thread.

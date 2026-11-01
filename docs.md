@@ -377,6 +377,12 @@ Three because each user opens one socket per channel — `/ws/otp/signin`,
 thread, nothing is left to answer `/api/health` or accept `POST /api/messages` — at
 64 sockets on 1 x 64 threads both failed while the sockets themselves stayed up.
 
+Concretely, 15 users is 45 sockets, so `WEB_THREADS: "50"`. A run at exactly the socket
+count also passes sometimes — 15 sockets on `WEB_THREADS: "15"` did — but only because
+the sockets spread across the four workers; when one worker takes them all, its ingest
+and health stop answering. Whether that happens is luck rather than configuration, so
+always keep spare threads above the socket count.
+
 Extra workers do not add socket headroom, because gunicorn does not spread long-lived
 connections evenly across workers. Measured on this machine, opening sockets one at a
 time until the server stopped accepting:
@@ -386,6 +392,8 @@ time until the server stopped accepting:
 | 1 × 64 | 64 (all slots, as expected) |
 | 3 × 16 | 16 — one worker absorbed every connection and the other two stayed idle |
 | 3 × 32 | 59 — first worker at 27, the other two pinned at 16 each |
+| 4 × 20, 15 sockets open | 15 sockets live, health 2 ms, SMS ingest 12 ms |
+| 4 × 50, 45 sockets open | 45 sockets live, health 5 ms, SMS ingest 13 ms |
 
 The last two rows are the trap: 48 and 96 slots existed, yet the server stopped
 accepting once no single worker had a free thread, so the peer's upgrade timed out.

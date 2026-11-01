@@ -48,10 +48,9 @@ DEFAULT_PATTERNS_FILE = os.path.join(
 # pattern runs so one rule covers both scripts.
 _BENGALI_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 
-# The separators providers actually alternate between. IVAC's format moved
-# from "-" to "_", so both (and whitespace) must be equivalent.
-_SEPARATOR_CHARS = r"\s\-_.·•"
-_SEP_ONLY_RE = re.compile(r"[\s\-_.·•]*")
+# The separators providers actually alternate between.
+_SEPARATOR_CHARS = r"\s\-_.·•/,:"
+_SEP_ONLY_RE = re.compile(r"[\s\-_.·•/,:]*")
 _TOKEN_RE = re.compile(r"[a-z]+|\d")
 # The trailing lookahead has to span separators: without it "12 34 56"
 # matches only "12 34" and the span looks like a two-group non-code.
@@ -62,6 +61,8 @@ _DIGIT_GROUP_SPLIT_RE = re.compile(r"[" + _SEPARATOR_CHARS + r"]+")
 # Word boundaries matter: without them an 11-digit phone number would be
 # truncated to 8 digits and read as a code.
 _CONTIGUOUS_RE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
+_ALPHANUM_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{4,10}(?![A-Za-z0-9])")
+_ALPHA_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{4,10}(?![A-Za-z0-9])")
 _TRX_TOKEN_RE = re.compile(r"[A-Za-z0-9]{6,20}")
 _AMOUNT_RE = re.compile(
     # "Tk.3,000.00" and "Tk 3,000.00" are the same amount: bKash writes the
@@ -75,6 +76,41 @@ _WARNING_END_RE = re.compile(r"[.!?\n]")
 # How close a code must sit to a warning-covered OTP keyword before it counts as
 # that keyword's code ("Do not share your OTP 123456 with anyone").
 _OTP_WARNING_WINDOW = 24
+
+COMMON_STOP_WORDS = {
+    "your", "this", "that", "with", "from", "have", "been", "sent", "will", "expires",
+    "please", "welcome", "security", "message", "service", "services", "account",
+    "prompted", "sequence", "following", "valid", "minutes", "verification",
+    "password", "passcode", "number", "payment", "purchase", "amount",
+    "balance", "received", "successful", "share", "anyone", "helpline",
+    "banking", "mobile", "gateway", "offer", "cashback", "transaction",
+    "secret", "detail", "details", "contact", "update", "online",
+    "nagad", "bkash", "rocket", "dbbl", "upay", "dutch", "bangla",
+    "code", "pin", "pass", "word", "three", "four", "five", "prize", "today"
+}
+
+COMPOUND_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+COMPOUND_TEENS = {
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19",
+}
+COMPOUND_UNITS = {
+    "zero": 0, "oh": 0, "o": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+}
+
+LABELED_DIRECT_RE = re.compile(
+    r"\b(?:otp|verification\s+code|verify\s+code|security\s+code|login\s+code|"
+    r"confirmation\s+code|passcode|password|pin|your\s+code|code|following\s+sequence|"
+    r"sequence\s+when\s+prompted|type\s+the\s+following\s+sequence|security\s+sequence)\b"
+    r"[\s:=,\-]*(?:is|are|to|for|when\s+prompted)?[\s:=,\-]*"
+    r"([A-Za-z0-9]{4,10})\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -287,7 +323,7 @@ def _number_word_run(lower_text: str) -> str:
 
 
 def _separated_span(text: str) -> str:
-    """A uniformly grouped, separator-joined code: ``1_2_3_4_5_6``.
+    """A uniformly grouped, separator-joined code: ``1_2_3_4_5_6``, ``1 2 3 4 5 6``.
 
     The uniform-group rule is what keeps dates (``12-10-2026``) and decimal
     amounts (``1,234.56``) from being read as codes.
@@ -295,15 +331,121 @@ def _separated_span(text: str) -> str:
     best = ""
     for match in _SEPARATED_SPAN_RE.finditer(text):
         groups = [g for g in _DIGIT_GROUP_SPLIT_RE.split(match.group(0)) if g]
-        if len(groups) < 3:
+        if len(groups) < 2:
+            continue
+        # Avoid dates like 31-12-2026 or 2026-12-31
+        if len(groups) == 3 and (len(groups[0]) == 4 or len(groups[2]) == 4):
             continue
         lengths = {len(g) for g in groups}
-        if len(lengths) != 1 or lengths.pop() > 2:
+        if len(lengths) > 2 or (len(lengths) == 2 and max(lengths) - min(lengths) > 1):
             continue
         digits = "".join(groups)
         if 4 <= len(digits) <= 8 and len(digits) > len(best):
             best = digits
     return best
+
+
+def _compound_word_run(lower_text: str) -> str:
+    """Compound worded chunks: Ten Eleven Eighty Six -> 101186."""
+    last_end = None
+    best_digits = ""
+    current_tokens = []
+
+    def flush(curr):
+        nonlocal best_digits
+        if not curr:
+            return
+        out = []
+        i = 0
+        saw_compound = False
+        while i < len(curr):
+            w = curr[i]
+            if w in COMPOUND_TENS:
+                saw_compound = True
+                if (
+                    i + 1 < len(curr)
+                    and curr[i + 1] in COMPOUND_UNITS
+                    and COMPOUND_UNITS[curr[i + 1]] > 0
+                ):
+                    out.append(str(COMPOUND_TENS[w] + COMPOUND_UNITS[curr[i + 1]]))
+                    i += 2
+                else:
+                    out.append(str(COMPOUND_TENS[w]))
+                    i += 1
+            elif w in COMPOUND_TEENS:
+                saw_compound = True
+                out.append(COMPOUND_TEENS[w])
+                i += 1
+            elif w in COMPOUND_UNITS:
+                out.append(str(COMPOUND_UNITS[w]))
+                i += 1
+            elif w.isdigit():
+                out.append(w)
+                i += 1
+            else:
+                i += 1
+        res = "".join(out)
+        if saw_compound and 4 <= len(res) <= 10 and len(res) > len(best_digits):
+            best_digits = res
+
+    for match in _TOKEN_RE.finditer(lower_text):
+        if last_end is not None and not _SEP_ONLY_RE.fullmatch(
+            lower_text[last_end:match.start()]
+        ):
+            flush(current_tokens)
+            current_tokens = []
+        tok = match.group(0)
+        if (
+            tok in COMPOUND_TENS
+            or tok in COMPOUND_TEENS
+            or tok in COMPOUND_UNITS
+            or tok.isdigit()
+        ):
+            current_tokens.append(tok)
+        else:
+            flush(current_tokens)
+            current_tokens = []
+        last_end = match.end()
+    flush(current_tokens)
+    return best_digits
+
+
+def _extract_labeled_otp(text: str) -> str:
+    """Extract directly labeled OTP: OTP is Ab76gTf, Code: 123456, etc."""
+    for m in LABELED_DIRECT_RE.finditer(text):
+        candidate = m.group(1)
+        for prefix in ("otp", "pin", "code"):
+            if candidate.lower().startswith(prefix) and candidate[len(prefix):].isdigit():
+                return candidate[len(prefix):]
+        if candidate.lower() not in COMMON_STOP_WORDS:
+            return candidate
+    return ""
+
+
+def _extract_alphanumeric_otp(text: str) -> str:
+    """Standalone alphanumeric token: letters + digits, 4-10 chars, any case."""
+    for m in _ALPHANUM_RE.finditer(text):
+        tok = m.group(0)
+        if any(c.isalpha() for c in tok) and any(c.isdigit() for c in tok):
+            for prefix in ("otp", "pin", "code"):
+                if tok.lower().startswith(prefix) and tok[len(prefix):].isdigit():
+                    return tok[len(prefix):]
+            if tok.lower() not in COMMON_STOP_WORDS:
+                return tok
+    return ""
+
+
+def _extract_alphabet_only_otp(text: str) -> str:
+    """Alphabet-only token: letters only, 4-10 chars, any case (e.g. AbCdEfGh)."""
+    stripped = text.strip()
+    if re.fullmatch(r"[A-Za-z]{4,10}", stripped) and stripped.lower() not in COMMON_STOP_WORDS:
+        return stripped
+    for m in _ALPHA_RE.finditer(text):
+        tok = m.group(0)
+        if tok.lower() not in COMMON_STOP_WORDS:
+            if any(c.isupper() for c in tok) and any(c.islower() for c in tok):
+                return tok
+    return ""
 
 
 def _contiguous_block(text: str, start: int = 0) -> str:
@@ -374,31 +516,60 @@ def _otp_anchor(lower_text: str, patterns: SmsPatterns) -> Optional[Tuple[int, i
 
 
 def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
-    """The OTP from a message, in digits, or ``""``.
-
-    Order matters: word runs and explicitly separated digits are unambiguous,
-    a contiguous block is not — so when the body names an OTP, the block is
-    read from just after that keyword instead of "whichever number is last".
+    """The OTP from a message following all 7 formats in order:
+    1. Worded digits (Zero–Nine) — any separator (- _ space / . , :)
+    2. Labeled — OTP / code / pin / password / passcode / verification code + value
+    3. Spaced/hyphen digits — 4–8 digits with spaces/hyphens
+    4. Alphanumeric — letters + digits, 4–10 chars, any case
+    5. Numeric — plain 4–8 digits
+    6. Compound worded — Ten–Ninety style chunks
+    7. Alphabet-only — letters only, 4–10 chars, any case
     """
     patterns = patterns or get_patterns()
     text = normalize_text(message)
     lower = text.lower()
 
+    # 1. Worded digits (Zero–Nine) — any separator (- _ space / . , :)
     word_run = _number_word_run(lower)
     if word_run:
         return word_run
 
+    # 2. Labeled — OTP / code / pin / password / passcode / verification code + value
+    labeled = _extract_labeled_otp(text)
+    if labeled:
+        return labeled
+
+    # 3. Spaced/hyphen digits — 4–8 digits with spaces/hyphens
     separated = _separated_span(text)
     if separated:
         return separated
 
+    # 4. Alphanumeric — letters + digits, 4–10 chars, any case
+    alnum = _extract_alphanumeric_otp(text)
+    if alnum:
+        return alnum
+
+    # 5. Numeric — plain 4–8 digits
     anchor = _otp_anchor(lower, patterns)
     if anchor:
         block = _contiguous_block(text, start=anchor[1])
         if block:
             return block
+    numeric = _contiguous_block(text)
+    if numeric:
+        return numeric
 
-    return _contiguous_block(text)
+    # 6. Compound worded — Ten–Ninety style chunks
+    compound = _compound_word_run(lower)
+    if compound:
+        return compound
+
+    # 7. Alphabet-only — letters only, 4–10 chars, any case
+    alpha = _extract_alphabet_only_otp(text)
+    if alpha:
+        return alpha
+
+    return ""
 
 
 def extract_trx_id(message, patterns: Optional[SmsPatterns] = None) -> str:
@@ -530,35 +701,77 @@ def parse_sms(
     amount = extract_amount(text)
 
     signin_keyword = _first_keyword(lower, patterns.keywords.get("signin", ()))
+    payment_keyword = _first_keyword(lower, patterns.keywords.get("payment", ()))
+
+    # MFS (Mobile Financial Services) detection:
+    # A message is from an MFS payment provider if body or sender matches a payment brand/shortcode.
+    sender_is_mfs = (mapped_sender and mapped_sender["family"] == KIND_PAYMENT) or (
+        sender_brand and sender_brand.family == KIND_PAYMENT
+    )
+    body_is_mfs = bool(body_brand and body_brand.family == KIND_PAYMENT)
+    is_mfs = sender_is_mfs or body_is_mfs
+
+    # A wallet message can name only its payee: "Your OTP for PAYMENT of
+    # Tk.3,000.00 to IVAC (DGePay) is 319805" is bKash's payment OTP, and
+    # the only brand in the body belongs to the merchant. The forwarder's
+    # sender number or brand is what says which wallet actually sent it.
+    if family == KIND_SIGNIN and sender_is_mfs and payment_keyword:
+        family = KIND_PAYMENT
+        sender_label = (mapped_sender and mapped_sender["label"]) or (
+            sender_brand and sender_brand.label
+        ) or "bKash"
+        is_mfs = True
 
     kind = KIND_UNKNOWN
     reason = "no OTP or transaction identifier found"
 
-    if otp and otp_keyword:
-        if family == KIND_PAYMENT:
+    # 1. First, check if it is an MFS transaction or payment OTP
+    if is_mfs or trx:
+        if otp and otp_keyword and family == KIND_PAYMENT:
             kind, reason = KIND_PAYMENT, "payment OTP (brand or sender says payment)"
-        elif (
-            family == KIND_SIGNIN
-            and mapped_sender
-            and mapped_sender["family"] == KIND_PAYMENT
-            and _first_keyword(lower, patterns.keywords.get("payment", ()))
-        ):
-            # A wallet message can name only its payee: "Your OTP for PAYMENT of
-            # Tk.3,000.00 to IVAC (DGePay) is 319805" is bKash's payment OTP, and
-            # the only brand in the body belongs to the merchant. The forwarder's
-            # sender number is what says which wallet actually sent it.
-            family, sender_label = KIND_PAYMENT, mapped_sender["label"]
-            kind, reason = KIND_PAYMENT, "payment OTP (sender says payment, body names only the payee)"
-        elif family == KIND_SIGNIN:
-            kind, reason = KIND_SIGNIN, "sign-in OTP (brand or sender says sign-in)"
-        elif signin_keyword:
-            kind, reason = KIND_SIGNIN, "sign-in OTP (sign-in vocabulary in body)"
-        else:
-            reason = "OTP keyword and a code, but no recognised brand or sender"
-    elif trx:
-        kind, reason = KIND_TRANSACTION, "transaction ID"
-    elif otp:
-        reason = "code found but the body never calls it an OTP"
+        elif trx:
+            kind, reason = KIND_TRANSACTION, "transaction ID"
+            if not sender_label or sender_label == raw_sender:
+                if mapped_sender:
+                    sender_label = mapped_sender["label"]
+                elif sender_brand:
+                    sender_label = sender_brand.label
+        elif otp and otp_keyword:
+            kind, reason = KIND_PAYMENT, "payment OTP (MFS payment OTP)"
+        elif otp:
+            reason = "code found but the body never calls it an OTP"
+    else:
+        # 2. Not from MFS: if an OTP sequence / code is found, route to IVAC sign-in OTP
+        has_otp_sequence = bool(
+            otp
+            and (
+                otp_keyword
+                or _number_word_run(lower)
+                or _extract_labeled_otp(text)
+                or _separated_span(text)
+                or _extract_alphanumeric_otp(text)
+                or _compound_word_run(lower)
+                or _extract_alphabet_only_otp(text)
+                or re.fullmatch(r"[A-Za-z0-9]{4,10}", text.strip())
+                or family == KIND_SIGNIN
+                or signin_keyword
+            )
+        )
+
+        if has_otp_sequence and otp:
+            kind = KIND_SIGNIN
+            if family == KIND_SIGNIN:
+                reason = "sign-in OTP (brand or sender says sign-in)"
+            elif signin_keyword:
+                reason = "sign-in OTP (sign-in vocabulary in body)"
+            else:
+                reason = "sign-in OTP (IVAC default for non-MFS OTP)"
+
+            # Ensure sender is labeled as IVAC if unknown or unmapped
+            if not sender_label or sender_label == raw_sender or sender_label not in ("IVAC", "IVACBD"):
+                sender_label = "IVAC"
+        elif otp:
+            reason = "code found but the body never calls it an OTP"
 
     # Only publish the fields that belong to the chosen channel: an "unknown"
     # message must not hand a consumer a neighbouring number as if it were an

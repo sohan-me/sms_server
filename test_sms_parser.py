@@ -276,12 +276,15 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(parsed.amount, "")
         self.assertTrue(parsed.reason)
 
-    def test_otp_without_a_brand_or_mapped_sender_is_unknown(self):
-        # An unmapped gateway number: 16247/16216/16167 are the wallet
-        # shortcodes and would resolve the channel on their own.
+    def test_otp_without_mfs_brand_defaults_to_ivac_signin(self):
+        # When not from MFS, any message with an OTP sequence is routed to IVAC
+        # sign-in OTP even if the sender is an unmapped gateway number and the
+        # body does not name IVAC.
         parsed = parse_sms("Your OTP is 123456", sender="09611123456", patterns=PATTERNS)
-        self.assertEqual(parsed.kind, KIND_UNKNOWN)
-        self.assertIn("brand", parsed.reason)
+        self.assertEqual(parsed.kind, KIND_SIGNIN)
+        self.assertEqual(parsed.otp, "123456")
+        self.assertEqual(parsed.sender, "IVAC")
+        self.assertEqual(parsed.sender_number, "09611123456")
 
     def test_sender_map_resolves_a_body_without_a_brand(self):
         patterns = patterns_with(
@@ -408,6 +411,38 @@ class RealProviderTemplateTests(unittest.TestCase):
         )
         self.assertEqual(parsed.kind, KIND_SIGNIN)
         self.assertEqual(parsed.otp, "123456")
+
+    def test_ivacbd_sequence_prompt_format(self):
+        body = "(IVACBD) For security, type the following sequence when prompted 257000"
+        parsed = parse_sms(body, patterns=PATTERNS)
+        self.assertEqual(parsed.kind, KIND_SIGNIN)
+        self.assertEqual(parsed.otp, "257000")
+        self.assertEqual(parsed.code, "257000")
+        self.assertEqual(parsed.sender, "IVAC")
+
+    def test_ivacbd_sequence_prompt_with_sender(self):
+        body = "(IVACBD) For security, type the following sequence when prompted 257000"
+        parsed = parse_sms(body, sender="IVACBD", patterns=PATTERNS)
+        self.assertEqual(parsed.kind, KIND_SIGNIN)
+        self.assertEqual(parsed.otp, "257000")
+        self.assertEqual(parsed.sender, "IVAC")
+
+    def test_ivacbd_flexible_digit_lengths_4_to_8(self):
+        lengths = (
+            ("2570", "4-digit"),
+            ("25701", "5-digit"),
+            ("257000", "6-digit"),
+            ("2570001", "7-digit"),
+            ("25700012", "8-digit"),
+        )
+        for code, label in lengths:
+            with self.subTest(label=label):
+                body = f"(IVACBD) For security, type the following sequence when prompted {code}"
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, code)
+                self.assertEqual(parsed.code, code)
+                self.assertEqual(parsed.sender, "IVAC")
 
 
 class ForwarderAddressTests(unittest.TestCase):
@@ -574,6 +609,107 @@ class PatternLoadingTests(unittest.TestCase):
     def test_otp_keywords_are_required(self):
         with self.assertRaises(ValueError):
             patterns_with(keywords={"signin": ["login"]})
+
+
+class AllOtpFormatsTests(unittest.TestCase):
+    """Verifies all 7 OTP formats detected by the app in order."""
+
+    def test_1_worded_digits_zero_to_nine(self):
+        cases = (
+            ("Six-Zero-One-Seven-Eight-One", "601781"),
+            ("Four_Zero_Three_Seven_Two_Four", "403724"),
+            ("One/Two/Three/Four/Five/Six", "123456"),
+            ("One, Two, Three, Four, Five, Six", "123456"),
+            ("One:Two:Three:Four:Five:Six", "123456"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+                self.assertEqual(parsed.sender, "IVAC")
+
+    def test_2_labeled_otp(self):
+        cases = (
+            ("OTP is Ab76gTf", "Ab76gTf"),
+            ("Your verification code is Ab76gTf", "Ab76gTf"),
+            ("passcode: 987654", "987654"),
+            ("pin is 4821", "4821"),
+            ("password: AbCdEf", "AbCdEf"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
+    def test_3_spaced_hyphen_digits(self):
+        cases = (
+            ("1 2 3 4 5 6", "123456"),
+            ("1-2-3-4-5-6", "123456"),
+            ("123-456", "123456"),
+            ("12 34 56", "123456"),
+            ("1234-5678", "12345678"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
+    def test_4_alphanumeric(self):
+        cases = (
+            ("Ab76gTf", "Ab76gTf"),
+            ("Your verification sequence Ab76gTf expires soon", "Ab76gTf"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
+    def test_5_numeric(self):
+        cases = (
+            ("1234", "1234"),
+            ("12345", "12345"),
+            ("123456", "123456"),
+            ("12345678", "12345678"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
+    def test_6_compound_worded(self):
+        cases = (
+            ("Ten Eleven Eighty Six", "101186"),
+            ("Twenty Three Forty Five Sixty Seven", "234567"),
+            ("Twelve Thirty Four Fifty Six", "123456"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
+    def test_7_alphabet_only(self):
+        cases = (
+            ("AbCdEfGh", "AbCdEfGh"),
+            ("Your login code AbCdEfGh expires in 5 min", "AbCdEfGh"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
 
 
 if __name__ == "__main__":
