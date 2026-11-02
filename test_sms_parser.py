@@ -612,7 +612,7 @@ class PatternLoadingTests(unittest.TestCase):
 
 
 class AllOtpFormatsTests(unittest.TestCase):
-    """Verifies all 7 OTP formats detected by the app in order."""
+    """Verifies all 8 OTP formats detected by the app in order."""
 
     def test_1_worded_digits_zero_to_nine(self):
         cases = (
@@ -710,6 +710,79 @@ class AllOtpFormatsTests(unittest.TestCase):
                 parsed = parse_sms(body, patterns=PATTERNS)
                 self.assertEqual(parsed.kind, KIND_SIGNIN)
                 self.assertEqual(parsed.otp, expected)
+
+    def test_8_character_by_character_alphanumeric(self):
+        cases = (
+            ("Your IVAC verification code is A 1 g 0 G i 7", "A1g0Gi7"),
+            ("Your IVAC verification code is A-1-g-0-G-i-7", "A1g0Gi7"),
+            ("Your IVAC verification code is A_1_g_0_G_i_7", "A1g0Gi7"),
+            ("IVAC code: 1 2 3 4 F g L", "1234FgL"),
+            ("IVAC code: 1-2-3-4-F-g-L", "1234FgL"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+                self.assertEqual(parsed.code, expected)
+                self.assertEqual(parsed.sender, "IVAC")
+
+    def test_8_grouped_alphanumeric(self):
+        cases = (
+            ("Your IVAC verification code is A1-g0-Gi7", "A1g0Gi7"),
+            ("Your IVAC verification code is A1 g0 Gi7", "A1g0Gi7"),
+            ("Your IVAC verification code is A1_g0_Gi7", "A1g0Gi7"),
+            ("IVAC code: 12-34-A5", "1234A5"),
+            ("IVAC code: AB12-CD3", "AB12CD3"),
+            ("IVAC code: A1g0-Gi7Z", "A1g0Gi7Z"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+                self.assertEqual(parsed.code, expected)
+
+    def test_8_grouped_accepts_four_to_eight_characters(self):
+        for body, expected in (
+            ("IVAC code: A1-g0", "A1g0"),
+            ("IVAC code: A1-g0-G", "A1g0G"),
+            ("IVAC code: AB12-CD", "AB12CD"),
+            ("IVAC code: A1g0-Gi7Z", "A1g0Gi7Z"),
+        ):
+            with self.subTest(body=body):
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
+    def test_8_the_words_around_a_grouped_code_are_not_glued_to_it(self):
+        parsed = parse_sms(
+            "Your IVAC verification code is A1-g0-Gi7 and it expires in 5 minutes",
+            patterns=PATTERNS,
+        )
+        self.assertEqual(parsed.otp, "A1g0Gi7")
+
+    def test_8_character_by_character_accepts_four_to_eight_characters(self):
+        for code in ("A 1 g 0", "A 1 g 0 G", "A 1 g 0 G i", "A 1 g 0 G i 7", "A 1 g 0 G i 7 Z"):
+            with self.subTest(code=code):
+                expected = code.replace(" ", "")
+                body = f"Your IVAC verification code is {code}"
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
+    def test_8_a_separated_digit_run_is_not_truncated_at_the_first_letter(self):
+        # The digit-span reader used to stop at "F" and report 1234.
+        self.assertNotEqual(extract_otp_code("IVAC code: 1 2 3 4 F g L", PATTERNS), "1234")
+
+    def test_8_words_never_form_a_character_run(self):
+        # Only isolated single characters run together, so an ordinary sentence
+        # cannot be read as a code by the new reader.
+        self.assertEqual(extract_otp_code("Your code expires in 5 minutes", PATTERNS), "")
+        self.assertEqual(extract_otp_code("A B C D", PATTERNS), "")
+        self.assertNotEqual(extract_otp_code("IVAC code: A 1 g 0", PATTERNS), "A1g0A")
 
 
 if __name__ == "__main__":

@@ -61,8 +61,13 @@ _DIGIT_GROUP_SPLIT_RE = re.compile(r"[" + _SEPARATOR_CHARS + r"]+")
 # Word boundaries matter: without them an 11-digit phone number would be
 # truncated to 8 digits and read as a code.
 _CONTIGUOUS_RE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
-_ALPHANUM_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{4,10}(?![A-Za-z0-9])")
-_ALPHA_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{4,10}(?![A-Za-z0-9])")
+_ALPHANUM_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{4,8}(?![A-Za-z0-9])")
+_ALPHA_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{4,8}(?![A-Za-z0-9])")
+# A code split into groups: "A-1-g-0-G-i-7" (one character per group) and
+# "A1-g0-Gi7" (several). Groups are separated by the same characters, so the
+# grouping alone cannot be used to tell a code from a sentence — see
+# _is_code_group for what may join a run.
+_ALNUM_GROUP_RE = re.compile(r"[A-Za-z0-9]+")
 _TRX_TOKEN_RE = re.compile(r"[A-Za-z0-9]{6,20}")
 _AMOUNT_RE = re.compile(
     # "Tk.3,000.00" and "Tk 3,000.00" are the same amount: bKash writes the
@@ -108,7 +113,7 @@ LABELED_DIRECT_RE = re.compile(
     r"confirmation\s+code|passcode|password|pin|your\s+code|code|following\s+sequence|"
     r"sequence\s+when\s+prompted|type\s+the\s+following\s+sequence|security\s+sequence)\b"
     r"[\s:=,\-]*(?:is|are|to|for|when\s+prompted)?[\s:=,\-]*"
-    r"([A-Za-z0-9]{4,10})\b",
+    r"([A-Za-z0-9]{4,8})\b",
     re.IGNORECASE,
 )
 
@@ -322,6 +327,81 @@ def _number_word_run(lower_text: str) -> str:
     return "".join(best)
 
 
+def _group_kind(token: str) -> str:
+    """How one separator-delimited group can take part in a code run.
+
+    ``mixed`` (``A1``, ``Gi7``), ``digits`` (``1234``) and ``char`` (``A``,
+    ``7``) always belong. ``letters`` (``CD``, ``XYZ``) is a code's letter-only
+    tail and only belongs after a mixed group. ``word`` (``code``, ``OTP``,
+    ``is``, ``in``, ``verification``) is what separates the prose from the
+    code and never belongs — the vowel test is what tells a code tail from a
+    short English word, all of which are written with a vowel.
+    """
+    has_letter = any(c.isalpha() for c in token)
+    has_digit = any(c.isdigit() for c in token)
+    if has_letter and has_digit:
+        return "mixed"
+    if has_digit:
+        return "digits"
+    if len(token) == 1:
+        return "char"
+    if len(token) <= 3 and not any(c in "aeiou" for c in token.lower()):
+        return "letters"
+    return "word"
+
+
+def _separated_alnum_run(text: str) -> str:
+    """A mixed letter/digit code split into groups.
+
+    IVAC separates the characters of an alphanumeric code the way it used to
+    separate digits — ``A-1-g-0-G-i-7`` — and also groups them, as in
+    ``A1-g0-Gi7``, in the same 4–8 character range. The digit-only span reader
+    saw ``1 2 3 4 F g L`` as the two-group span ``1234`` and returned a
+    truncated code, and an all-character body such as ``A 1 g 0 G i 7``
+    yielded nothing at all.
+    """
+    best = ""
+    current: List[str] = []
+    seen_mixed = False
+
+    def flush() -> None:
+        nonlocal best, seen_mixed
+        joined = "".join(current)
+        if (
+            len(current) >= 2
+            and 4 <= len(joined) <= 8
+            and any(c.isalpha() for c in joined)
+            and any(c.isdigit() for c in joined)
+            and len(joined) > len(best)
+        ):
+            best = joined
+        current.clear()
+        seen_mixed = False
+
+    previous_end = None
+    for match in _ALNUM_GROUP_RE.finditer(text):
+        if previous_end is not None and not _SEP_ONLY_RE.fullmatch(
+            text[previous_end:match.start()]
+        ):
+            flush()
+        token = match.group(0)
+        kind = _group_kind(token)
+        if kind == "word":
+            flush()
+        elif kind == "letters":
+            # Only a tail of a code that already showed a mixed group:
+            # "AB12-CD" is a code, "by A1" is prose.
+            if seen_mixed:
+                current.append(token)
+        else:
+            current.append(token)
+            seen_mixed = seen_mixed or kind == "mixed"
+        previous_end = match.end()
+
+    flush()
+    return best
+
+
 def _separated_span(text: str) -> str:
     """A uniformly grouped, separator-joined code: ``1_2_3_4_5_6``, ``1 2 3 4 5 6``.
 
@@ -385,7 +465,7 @@ def _compound_word_run(lower_text: str) -> str:
             else:
                 i += 1
         res = "".join(out)
-        if saw_compound and 4 <= len(res) <= 10 and len(res) > len(best_digits):
+        if saw_compound and 4 <= len(res) <= 8 and len(res) > len(best_digits):
             best_digits = res
 
     for match in _TOKEN_RE.finditer(lower_text):
@@ -438,7 +518,7 @@ def _extract_alphanumeric_otp(text: str) -> str:
 def _extract_alphabet_only_otp(text: str) -> str:
     """Alphabet-only token: letters only, 4-10 chars, any case (e.g. AbCdEfGh)."""
     stripped = text.strip()
-    if re.fullmatch(r"[A-Za-z]{4,10}", stripped) and stripped.lower() not in COMMON_STOP_WORDS:
+    if re.fullmatch(r"[A-Za-z]{4,8}", stripped) and stripped.lower() not in COMMON_STOP_WORDS:
         return stripped
     for m in _ALPHA_RE.finditer(text):
         tok = m.group(0)
@@ -516,14 +596,19 @@ def _otp_anchor(lower_text: str, patterns: SmsPatterns) -> Optional[Tuple[int, i
 
 
 def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
-    """The OTP from a message following all 7 formats in order:
+    """The OTP from a message following all 8 formats in order.
+
+    Every format accepts 4–8 characters; anything longer is not a code this
+    server forwards.
+
     1. Worded digits (Zero–Nine) — any separator (- _ space / . , :)
-    2. Labeled — OTP / code / pin / password / passcode / verification code + value
-    3. Spaced/hyphen digits — 4–8 digits with spaces/hyphens
-    4. Alphanumeric — letters + digits, 4–10 chars, any case
-    5. Numeric — plain 4–8 digits
-    6. Compound worded — Ten–Ninety style chunks
-    7. Alphabet-only — letters only, 4–10 chars, any case
+    2. Separated groups — A 1 g 0 G i 7, A1-g0-Gi7, letters + digits, 4–8 chars
+    3. Labeled — OTP / code / pin / password / passcode / verification code + value
+    4. Spaced/hyphen digits — 4–8 digits with spaces/hyphens
+    5. Alphanumeric — letters + digits, 4–8 chars, any case
+    6. Numeric — plain 4–8 digits
+    7. Compound worded — Ten–Ninety style chunks
+    8. Alphabet-only — letters only, 4–8 chars, any case
     """
     patterns = patterns or get_patterns()
     text = normalize_text(message)
@@ -534,22 +619,29 @@ def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
     if word_run:
         return word_run
 
-    # 2. Labeled — OTP / code / pin / password / passcode / verification code + value
+    # 2. Separated groups — A 1 g 0 G i 7, A1-g0-Gi7, letters + digits, 4–8 chars
+    #    Before the labeled reader on purpose: "code: AB12-CD3" would otherwise
+    #    stop at the first group and report "AB12".
+    spaced_alnum = _separated_alnum_run(text)
+    if spaced_alnum:
+        return spaced_alnum
+
+    # 3. Labeled — OTP / code / pin / password / passcode / verification code + value
     labeled = _extract_labeled_otp(text)
     if labeled:
         return labeled
 
-    # 3. Spaced/hyphen digits — 4–8 digits with spaces/hyphens
+    # 4. Spaced/hyphen digits — 4–8 digits with spaces/hyphens
     separated = _separated_span(text)
     if separated:
         return separated
 
-    # 4. Alphanumeric — letters + digits, 4–10 chars, any case
+    # 5. Alphanumeric — letters + digits, 4–8 chars, any case
     alnum = _extract_alphanumeric_otp(text)
     if alnum:
         return alnum
 
-    # 5. Numeric — plain 4–8 digits
+    # 6. Numeric — plain 4–8 digits
     anchor = _otp_anchor(lower, patterns)
     if anchor:
         block = _contiguous_block(text, start=anchor[1])
@@ -559,12 +651,12 @@ def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
     if numeric:
         return numeric
 
-    # 6. Compound worded — Ten–Ninety style chunks
+    # 7. Compound worded — Ten–Ninety style chunks
     compound = _compound_word_run(lower)
     if compound:
         return compound
 
-    # 7. Alphabet-only — letters only, 4–10 chars, any case
+    # 8. Alphabet-only — letters only, 4–8 chars, any case
     alpha = _extract_alphabet_only_otp(text)
     if alpha:
         return alpha
@@ -748,11 +840,12 @@ def parse_sms(
                 otp_keyword
                 or _number_word_run(lower)
                 or _extract_labeled_otp(text)
+                or _separated_alnum_run(text)
                 or _separated_span(text)
                 or _extract_alphanumeric_otp(text)
                 or _compound_word_run(lower)
                 or _extract_alphabet_only_otp(text)
-                or re.fullmatch(r"[A-Za-z0-9]{4,10}", text.strip())
+                or re.fullmatch(r"[A-Za-z0-9]{4,8}", text.strip())
                 or family == KIND_SIGNIN
                 or signin_keyword
             )
