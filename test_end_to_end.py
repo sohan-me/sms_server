@@ -5,14 +5,14 @@ requests, a real admin-panel login, and real WebSocket connections over TCP.
 The test walks the whole product in order:
 
   server up -> register -> pending socket refused -> admin approves ->
-  authenticate -> claim payment numbers -> connect every channel -> forward
-  real provider SMS -> receive sign-in / payment / transaction frames ->
-  counters -> history -> isolation between two users -> token rotation ->
-  release and hand-over -> restart with state intact.
+  authenticate -> connect the sign-in and legacy sockets -> forward a real
+  IVAC SMS -> receive the frame on both -> overwrite it with a newer OTP ->
+  drop an unrecognised message -> HTTP reads -> removed payment endpoints ->
+  token rotation -> restart with state intact.
 
-The SMS bodies are the real Bangladesh wallet templates the parser must handle,
-posted in the forwarder's real shape (`receiver` and `sender` numbers), so a
-regression in routing, counting or scoping fails here first.
+The SMS body is the real IVAC template the parser must handle, posted in the
+forwarder's real shape (`receiver` and `sender` numbers), so a regression in
+routing or delivery fails here first.
 """
 
 import http.cookiejar
@@ -34,42 +34,9 @@ import websocket
 ADMIN_USERNAME = "incomplete"
 ADMIN_PASSWORD = "journey-admin-password"
 
-# Real sender shortcodes, as the forwarder reports them.
-ROCKET_SENDER = "16216"
-BKASH_SENDER = "16247"
-NAGAD_SENDER = "16167"
-
 SIGNIN_OTP = "Your IVAC verification code is 601781. Do not share it with anyone."
-ROCKET_OTP = "Your security code for Rocket transaction is 525926."
-ROCKET_TRX = (
-    "Tk4,500.00 paid through e-Commerce gateway. NetBal: Tk112,601.25 "
-    "TxnId: 7028086216 Date:08-OCT-26 01:31:57 pm. Don't share your PIN with anybody"
-)
-BKASH_OTP = (
-    "Do NOT share your OTP or PIN with anyone. Your bKash OTP for PAYMENT of "
-    "Tk.3,000.00 to IVAC (DGePay) is 319805. Expires in 2 min."
-)
-BKASH_TRX = (
-    "Payment of Tk 3,000.00 to DGEPAY SERVICES LIMITED-RM62457 is successful. "
-    "Balance Tk 11,620.91. TrxID DJM4DNBFXE at 22/10/2026 14:02"
-)
-BKASH_TRX_2 = (
-    "Payment of Tk 1,500.00 to DGEPAY SERVICES LIMITED-RM62457 is successful. "
-    "Balance Tk 10,120.91. TrxID A1B2C3D4E5 at 22/10/2026 14:20"
-)
-NAGAD_OTP = (
-    "NEVER share your OTP or PIN with anyone. Nagad will never ask for these.\n"
-    "Your OTP for Nagad ECOM payment is 035568.\n"
-    "Validity: 2 minutes.\nHelpline: 16167"
-)
-NAGAD_TRX = (
-    "Payment to 'DGePAY Services Limite' is Successful.\n"
-    "Amount: Tk 6000.0\nTxnID: 75PRV4ZK\nBalance: Tk 31840.01\n23/07/2026 16:57"
-)
-NAGAD_TRX_2 = (
-    "Payment to 'DGePAY Services Limite' is Successful.\n"
-    "Amount: Tk 900.0\nTxnID: 91QW2ERT\nBalance: Tk 30940.01\n23/07/2026 17:31"
-)
+SIGNIN_OTP_2 = "Your IVAC verification code is 883322. Do not share it with anyone."
+UNRECOGNISED_SMS = "Get 50% cashback on your next purchase. Valid till 31-12-2026."
 
 
 def _free_port():
@@ -233,6 +200,21 @@ class LiveServer:
     def delete_json(self, path, expect=200, token=None):
         return self.request_json(path, None, "DELETE", expect, token)
 
+    def assert_status(self, path, expect, method="GET", payload=None):
+        """Assert a status without parsing a body (a 404 page is not JSON)."""
+        body = None if payload is None else json.dumps(payload).encode()
+        request = urllib.request.Request(
+            self.base + path,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        status, raw = self._open(request)
+        if status != expect:
+            raise AssertionError(
+                f"{method} {path} expected {expect}, got {status}: {raw[:400]!r}"
+            )
+
     def forward(self, phone, message, sender, expect=201):
         """Post an SMS exactly as the forwarder does: receiver + sender numbers."""
         return self.request_json(
@@ -393,10 +375,8 @@ class CompleteJourneyTests(unittest.TestCase):
 
     def test_a_to_z(self):
         server = self.server
-        signin_phone = "01710000001"
-        bkash_phone = "01710000002"
-        nagad_phone = "01710000003"
-        unclaimed_phone = "01710000099"
+        phone = "01710000001"
+        other_phone = "01710000002"
 
         alice = {
             "name": "Alice",
@@ -419,6 +399,7 @@ class CompleteJourneyTests(unittest.TestCase):
         self.assertTrue(health["redis_subscriber_alive"])
         self.assertTrue(health["db_poller_alive"])
         self.assertEqual(health["otp_fanout"], "redis")
+        self.assertNotIn("ws_clients_by_channel", health)
 
         # ── B. both devices register, pending approval ────────
         alice_id = server.post_json("/api/register", alice, expect=201)["user_id"]
@@ -429,9 +410,9 @@ class CompleteJourneyTests(unittest.TestCase):
 
         # ── C. no socket for a pending device, an unknown token
         #       or no token at all ──────────────────────────────
-        server.assert_socket_refused("/ws/otp/payment", server.device_token(alice_id))
-        server.assert_socket_refused("/ws/otp/payment")
-        server.assert_socket_refused("/ws/otp/payment", "not-a-real-token")
+        server.assert_socket_refused("/ws/otp/signin", server.device_token(alice_id))
+        server.assert_socket_refused("/ws/otp/signin")
+        server.assert_socket_refused("/ws/otp/signin", "not-a-real-token")
 
         # ── D. the admin approves both through the real panel ─
         server.admin_login()
@@ -456,55 +437,14 @@ class CompleteJourneyTests(unittest.TestCase):
             expect=404,
         )
 
-        # ── F. Alice claims the numbers she will pay from ─────
-        claimed = server.post_json(
-            "/api/payment/numbers",
-            {
-                "numbers": [bkash_phone, nagad_phone],
-                "mac_address": alice["mac_address"],
-                "motherboard_serial": alice["motherboard_serial"],
-            },
-            token=alice_token,
-        )
-        self.assertEqual(
-            claimed["numbers"],
-            [
-                {"phone": bkash_phone, "payment_count": 0},
-                {"phone": nagad_phone, "payment_count": 0},
-            ],
-        )
-        # Claiming again is a no-op; Bob cannot take Alice's number.
-        again = server.post_json(
-            "/api/payment/numbers", {"numbers": [bkash_phone]}, token=alice_token
-        )
-        self.assertEqual(len(again["numbers"]), 2)
-        self.assertNotIn("reclaimed", again)
-        conflict = server.post_json(
-            "/api/payment/numbers", {"numbers": [bkash_phone]}, expect=409, token=bob_token
-        )
-        self.assertEqual(conflict["numbers"], [bkash_phone])
-
-        # ── G. connect every channel ──────────────────────────
-        signin_ws = server.connect("/ws/otp/signin", [signin_phone, bkash_phone], alice_token)
-        legacy_ws = server.connect("/ws/otp", [signin_phone, bkash_phone], alice_token)
-        bkash_payment_ws = server.connect("/ws/otp/payment", bkash_phone, alice_token)
-        bkash_trx_ws = server.connect("/ws/otp/transaction", bkash_phone, alice_token)
-        nagad_payment_ws = server.connect("/ws/otp/payment", nagad_phone, alice_token)
-        nagad_trx_ws = server.connect("/ws/otp/transaction", nagad_phone, alice_token)
-        # Bob subscribes to Alice's numbers on purpose: scoping must ignore him.
-        bob_payment_ws = server.connect(
-            "/ws/otp/payment", [bkash_phone, nagad_phone], bob_token
-        )
-        bob_trx_ws = server.connect(
-            "/ws/otp/transaction", [bkash_phone, nagad_phone], bob_token
-        )
-        sockets = [
-            signin_ws, legacy_ws, bkash_payment_ws, bkash_trx_ws,
-            nagad_payment_ws, nagad_trx_ws, bob_payment_ws, bob_trx_ws,
-        ]
+        # ── F. connect the sign-in sockets ────────────────────
+        signin_ws = server.connect("/ws/otp/signin", phone, alice_token)
+        legacy_ws = server.connect("/ws/otp", phone, alice_token)
+        bob_ws = server.connect("/ws/otp/signin", other_phone, bob_token)
+        sockets = [signin_ws, legacy_ws, bob_ws]
         try:
-            # ── H. sign-in SMS: signin and legacy frames only ─
-            server.forward(signin_phone, SIGNIN_OTP, sender="8801700000000")
+            # ── G. a real IVAC sign-in SMS ────────────────────
+            server.forward(phone, SIGNIN_OTP, sender="8801700000000")
             frame = server.expect_frame(signin_ws, "signin frame")
             self.assertEqual(
                 sorted(frame),
@@ -513,246 +453,83 @@ class CompleteJourneyTests(unittest.TestCase):
             )
             self.assertEqual(frame["kind"], "signin")
             self.assertEqual(frame["otp"], "601781")
-            self.assertEqual(frame["phone"], signin_phone)
-            self.assertEqual(frame["receiver"], signin_phone)
+            self.assertEqual(frame["phone"], phone)
+            self.assertEqual(frame["receiver"], phone)
             self.assertEqual(frame["sender"], "IVAC")
             self.assertEqual(frame["sender_number"], "8801700000000")
             self.assertTrue(frame["last_updated"].endswith("+06:00"))
-            self.assertNotIn("trx", frame)
-            self.assertNotIn("payment_count", frame)
 
             legacy = server.expect_frame(legacy_ws, "legacy frame")
             self.assertEqual(sorted(legacy), ["last_updated", "otp", "phone"])
             self.assertEqual(legacy["otp"], "601781")
 
-            # A sign-in OTP never travels on the payment or transaction
-            # socket, even with that same phone subscribed to them.
-            server.expect_silence(bkash_payment_ws, "payment socket (signin sms)")
-            server.expect_silence(bkash_trx_ws, "transaction socket (signin sms)")
+            # A socket subscribed to a different number stays silent.
+            server.expect_silence(bob_ws, "bob's other-number socket")
 
-            # ── I. bKash payment OTP for a claimed number ─────
-            server.forward(bkash_phone, BKASH_OTP, sender=BKASH_SENDER)
-            frame = server.expect_frame(bkash_payment_ws, "bKash payment OTP")
-            self.assertEqual(
-                sorted(frame),
-                ["kind", "last_updated", "otp", "payment_count", "phone",
-                 "receiver", "sender", "sender_number"],
-            )
-            self.assertEqual(frame["kind"], "payment")
-            self.assertEqual(frame["otp"], "319805")
-            self.assertEqual(frame["sender"], "bKash")
-            self.assertEqual(frame["sender_number"], BKASH_SENDER)
-            # The body names only the payee; the merchant must not reroute it,
-            # and nothing has completed yet on this number.
-            self.assertEqual(frame["payment_count"], 0)
-            server.expect_silence(signin_ws, "signin socket (bKash payment OTP)")
-            server.expect_silence(bkash_trx_ws, "transaction socket (payment OTP)")
-            server.expect_silence(bob_payment_ws, "bob socket (alice payment OTP)")
-            server.expect_silence(nagad_payment_ws, "nagad socket (bKash payment OTP)")
+            # ── H. a newer OTP overwrites the number's row ────
+            server.forward(phone, SIGNIN_OTP_2, sender="8801700000000")
+            frame = server.expect_frame(signin_ws, "second signin frame")
+            self.assertEqual(frame["otp"], "883322")
+            legacy = server.expect_frame(legacy_ws, "second legacy frame")
+            self.assertEqual(legacy["otp"], "883322")
 
-            # ── J. bKash transaction: payment 1 of this number ─
-            server.forward(bkash_phone, BKASH_TRX, sender=BKASH_SENDER)
-            frame = server.expect_frame(bkash_trx_ws, "bKash transaction")
-            self.assertEqual(
-                sorted(frame),
-                ["amount", "kind", "last_updated", "payment_count", "phone",
-                 "receiver", "sender", "sender_number", "trx"],
-            )
-            self.assertEqual(frame["kind"], "transaction")
-            self.assertEqual(frame["trx"], "DJM4DNBFXE")
-            self.assertEqual(frame["amount"], "3000.00")
-            self.assertEqual(frame["sender"], "bKash")
-            self.assertEqual(frame["payment_count"], 1)
-            self.assertNotIn("otp", frame)
-            server.expect_silence(bob_trx_ws, "bob socket (alice transaction)")
+            # ── I. an unrecognised message is routed nowhere ──
+            routed = server.forward(phone, UNRECOGNISED_SMS, sender="8801700000000")
+            self.assertEqual(routed["routed"], "unknown")
+            server.expect_silence(signin_ws, "signin socket (unrecognised sms)")
+            self.assertEqual(server.get_json(f"/api/signin/{phone}")["otp"], "883322")
 
-            # ── K. a second file paid with the same number ────
-            server.forward(bkash_phone, BKASH_TRX_2, sender=BKASH_SENDER)
-            frame = server.expect_frame(bkash_trx_ws, "bKash transaction 2")
-            self.assertEqual(frame["trx"], "A1B2C3D4E5")
-            self.assertEqual(frame["amount"], "1500.00")
-            self.assertEqual(frame["payment_count"], 2)
+            # ── J. HTTP reads ─────────────────────────────────
+            signin_body = server.get_json(f"/api/signin/{phone}")
+            self.assertEqual(signin_body["otp"], "883322")
+            self.assertEqual(signin_body["sender"], "IVAC")
+            self.assertEqual(signin_body["receiver"], phone)
 
-            # ── L. a forwarder retry is not a new payment ─────
-            retry = server.forward(bkash_phone, BKASH_TRX, sender=BKASH_SENDER)
-            self.assertTrue(retry.get("duplicate"))
-            server.expect_silence(bkash_trx_ws, "transaction socket (retried trx)")
-            self.assertEqual(
-                server.get_json("/api/payment/numbers", token=alice_token)["numbers"][0][
-                    "payment_count"
-                ],
-                2,
-            )
+            legacy_body = server.get_json(f"/api/messages/{phone}")
+            self.assertEqual(sorted(legacy_body), ["last_updated", "message"])
+            self.assertEqual(legacy_body["message"], "883322")
 
-            # ── M. Nagad runs its own counter ─────────────────
-            server.forward(nagad_phone, NAGAD_OTP, sender=NAGAD_SENDER)
-            frame = server.expect_frame(nagad_payment_ws, "Nagad payment OTP")
-            self.assertEqual(frame["otp"], "035568")
-            self.assertEqual(frame["sender"], "Nagad")
-            self.assertEqual(frame["payment_count"], 0)
-            server.expect_silence(bkash_payment_ws, "bKash socket (Nagad OTP)")
+            # ── K. the payment / transaction contract is gone ─
+            for path in (
+                "/api/payment/numbers",
+                f"/api/payment/{phone}",
+                f"/api/transaction/{phone}",
+                f"/api/transaction/{phone}/history",
+            ):
+                server.assert_status(path, 404)
+            server.assert_status(
+                "/api/payment/numbers", 404, "POST", {"numbers": [phone]}
+            )
+            server.assert_status(f"/api/payment/numbers/{phone}", 404, "DELETE")
+            server.assert_socket_refused("/ws/otp/payment", alice_token)
+            server.assert_socket_refused("/ws/otp/transaction", alice_token)
 
-            server.forward(nagad_phone, NAGAD_TRX, sender=NAGAD_SENDER)
-            frame = server.expect_frame(nagad_trx_ws, "Nagad transaction")
-            self.assertEqual(frame["trx"], "75PRV4ZK")
-            self.assertEqual(frame["amount"], "6000.00")
-            self.assertEqual(frame["sender"], "Nagad")
-            self.assertEqual(frame["payment_count"], 1)
-
-            # ── N. the brandless Rocket body still gets its label ─
-            server.forward(unclaimed_phone, ROCKET_TRX, sender=ROCKET_SENDER)
-            # Nobody claimed this number, so no socket receives it...
-            server.expect_silence(bkash_trx_ws, "claimed socket (unclaimed number)")
-            server.expect_silence(bob_trx_ws, "bob socket (unclaimed number)")
-            # ...but it is stored and labelled from the sender shortcode.
-            stored = server.get_json(
-                f"/api/transaction/{unclaimed_phone}", token=server.ws_auth_token
-            )
-            self.assertEqual(stored["trx"], "7028086216")
-            self.assertEqual(stored["sender"], "Rocket")
-            self.assertEqual(stored["amount"], "4500.00")
-            server.get_json(
-                f"/api/transaction/{unclaimed_phone}", expect=403, token=alice_token
-            )
-
-            # ── O. authenticated HTTP reads ───────────────────
-            latest_payment = server.get_json(
-                f"/api/payment/{bkash_phone}", token=alice_token
-            )
-            self.assertEqual(latest_payment["otp"], "319805")
-            self.assertEqual(latest_payment["sender"], "bKash")
-            self.assertEqual(latest_payment["payment_count"], 0)
-
-            history = server.get_json(
-                f"/api/transaction/{bkash_phone}/history", token=alice_token
-            )
-            # Newest first, but two payments in the same second must not make
-            # the assertion depend on timestamp resolution.
-            self.assertEqual(
-                {item["trx"]: item["amount"] for item in history["transactions"]},
-                {"DJM4DNBFXE": "3000.00", "A1B2C3D4E5": "1500.00"},
-            )
-            self.assertEqual(
-                server.get_json("/api/payment/numbers", token=alice_token)["numbers"],
-                [
-                    {"phone": bkash_phone, "payment_count": 2},
-                    {"phone": nagad_phone, "payment_count": 1},
-                ],
-            )
-
-            # ── P. other users and anonymous callers are refused ─
-            server.get_json(f"/api/payment/{bkash_phone}", expect=401)
-            server.get_json(f"/api/payment/{bkash_phone}", expect=403, token=bob_token)
-            server.get_json(f"/api/transaction/{bkash_phone}", expect=403, token=bob_token)
-            server.get_json(
-                f"/api/transaction/{bkash_phone}/history", expect=403, token=bob_token
-            )
-            server.get_json("/api/payment/numbers", expect=401)
-            self.assertEqual(
-                server.get_json("/api/payment/numbers", token=bob_token)["numbers"], []
-            )
-            # Sign-in keeps its original open contract.
-            self.assertEqual(
-                server.get_json(f"/api/signin/{signin_phone}")["otp"], "601781"
-            )
-            self.assertEqual(
-                server.get_json(f"/api/messages/{signin_phone}")["message"], "601781"
-            )
-
-            # ── Q. the admin rotates Alice's token ────────────
+            # ── L. the admin rotates Alice's token ────────────
             old_token = alice_token
             server.admin_action(f"/admin/user/{alice_id}/regen-token")
             alice_token = server.device_token(alice_id)
             self.assertNotEqual(alice_token, old_token)
 
-            # The old token is dead on both transports, and the rotation hung up
-            # the sockets it had opened.
-            server.assert_socket_refused("/ws/otp/payment", old_token)
-            server.get_json(f"/api/payment/{bkash_phone}", expect=401, token=old_token)
-            server.get_json("/api/payment/numbers", expect=401, token=old_token)
-            for ws, label in (
-                (signin_ws, "signin socket"),
-                (legacy_ws, "legacy socket"),
-                (bkash_payment_ws, "payment socket"),
-                (bkash_trx_ws, "transaction socket"),
-                (nagad_payment_ws, "nagad payment socket"),
-                (nagad_trx_ws, "nagad transaction socket"),
-            ):
-                server.assert_server_closed(ws, label)
+            # The old token is dead on the socket, and the rotation hung up the
+            # sockets it had opened.
+            server.assert_socket_refused("/ws/otp/signin", old_token)
+            server.assert_server_closed(signin_ws, "signin socket")
+            server.assert_server_closed(legacy_ws, "legacy socket")
 
-            # The numbers, and their counters, survive the rotation.
-            self.assertEqual(
-                server.get_json("/api/payment/numbers", token=alice_token)["numbers"],
-                [
-                    {"phone": bkash_phone, "payment_count": 2},
-                    {"phone": nagad_phone, "payment_count": 1},
-                ],
-            )
-            # A socket opened with the new token keeps counting where it was.
-            rotated_payment_ws = server.connect(
-                "/ws/otp/payment", bkash_phone, alice_token
-            )
-            sockets.append(rotated_payment_ws)
-            server.forward(bkash_phone, BKASH_OTP, sender=BKASH_SENDER)
-            frame = server.expect_frame(rotated_payment_ws, "payment after rotation")
-            self.assertEqual(frame["otp"], "319805")
-            self.assertEqual(frame["payment_count"], 2)
+            # Sign-in reads keep their original open contract and survive it.
+            self.assertEqual(server.get_json(f"/api/signin/{phone}")["otp"], "883322")
 
-            # ── R. release a number and hand it to another device ─
-            released = server.delete_json(
-                f"/api/payment/numbers/{nagad_phone}", token=alice_token
-            )
-            self.assertEqual(
-                released["numbers"], [{"phone": bkash_phone, "payment_count": 2}]
-            )
-            taken = server.post_json(
-                "/api/payment/numbers",
-                {
-                    "numbers": [nagad_phone],
-                    "mac_address": bob["mac_address"],
-                    "motherboard_serial": bob["motherboard_serial"],
-                },
-                token=bob_token,
-            )
-            self.assertEqual(taken["numbers"], [{"phone": nagad_phone, "payment_count": 0}])
+            rotated_ws = server.connect("/ws/otp/signin", phone, alice_token)
+            sockets.append(rotated_ws)
+            server.forward(phone, SIGNIN_OTP, sender="8801700000000")
+            frame = server.expect_frame(rotated_ws, "signin after rotation")
+            self.assertEqual(frame["otp"], "601781")
 
-            # Ownership moved: the next Nagad payment reaches Bob, counted from
-            # his own zero, and Alice's reads are refused.
-            server.forward(nagad_phone, NAGAD_TRX_2, sender=NAGAD_SENDER)
-            frame = server.expect_frame(bob_trx_ws, "bob Nagad transaction")
-            self.assertEqual(frame["trx"], "91QW2ERT")
-            self.assertEqual(frame["payment_count"], 1)
-            server.get_json(f"/api/transaction/{nagad_phone}", expect=403, token=alice_token)
-            self.assertEqual(
-                server.get_json("/api/payment/numbers", token=bob_token)["numbers"],
-                [{"phone": nagad_phone, "payment_count": 1}],
-            )
-
-            # ── S. everything survives a server restart ───────
+            # ── M. the stored OTP survives a server restart ───
             server.restart()
+            self.assertEqual(server.get_json(f"/api/signin/{phone}")["otp"], "601781")
             self.assertEqual(
-                server.get_json("/api/payment/numbers", token=alice_token)["numbers"],
-                [{"phone": bkash_phone, "payment_count": 2}],
-            )
-            self.assertEqual(
-                server.get_json("/api/payment/numbers", token=bob_token)["numbers"],
-                [{"phone": nagad_phone, "payment_count": 1}],
-            )
-            self.assertEqual(
-                server.get_json(f"/api/payment/{bkash_phone}", token=alice_token)["otp"],
-                "319805",
-            )
-            self.assertEqual(
-                {item["trx"] for item in server.get_json(
-                    f"/api/transaction/{bkash_phone}/history", token=alice_token
-                )["transactions"]},
-                {"DJM4DNBFXE", "A1B2C3D4E5"},
-            )
-            self.assertEqual(
-                len(server.get_json(
-                    f"/api/transaction/{nagad_phone}/history", token=bob_token
-                )["transactions"]),
-                2,
+                server.get_json(f"/api/messages/{phone}")["message"], "601781"
             )
         finally:
             for ws in sockets:

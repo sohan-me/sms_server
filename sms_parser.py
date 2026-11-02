@@ -1,8 +1,9 @@
-"""Turn one SMS into a channel decision, a code and a sender label.
+"""Turn one inbound SMS into a sign-in OTP decision and a sender label.
 
 The server used to treat every inbound message as a single OTP stream: it
 scanned the body for a digit run and pushed it to every subscribed client.
-That cannot serve three channels, and it hard-codes one IVAC format.
+That hard-codes one IVAC format and cannot tell an OTP from a receipt, so the
+body is now classified and parsed instead.
 
 Three properties are deliberate here:
 
@@ -25,7 +26,6 @@ import re
 import threading
 import unicodedata
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from otp_core import NUMBER_WORD_TO_DIGIT
@@ -33,12 +33,10 @@ from otp_core import NUMBER_WORD_TO_DIGIT
 logger = logging.getLogger(__name__)
 
 KIND_SIGNIN = "signin"
-KIND_PAYMENT = "payment"
-KIND_TRANSACTION = "transaction"
 KIND_UNKNOWN = "unknown"
 
-# The three kinds that have a public endpoint and a WebSocket channel.
-DELIVERY_KINDS = (KIND_SIGNIN, KIND_PAYMENT, KIND_TRANSACTION)
+# The kinds that have a public endpoint and a WebSocket channel.
+DELIVERY_KINDS = (KIND_SIGNIN,)
 
 DEFAULT_PATTERNS_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sms_patterns.json"
@@ -68,16 +66,13 @@ _ALPHA_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{4,8}(?![A-Za-z0-9])")
 # grouping alone cannot be used to tell a code from a sentence — see
 # _is_code_group for what may join a run.
 _ALNUM_GROUP_RE = re.compile(r"[A-Za-z0-9]+")
-_TRX_TOKEN_RE = re.compile(r"[A-Za-z0-9]{6,20}")
-_AMOUNT_RE = re.compile(
-    # "Tk.3,000.00" and "Tk 3,000.00" are the same amount: bKash writes the
-    # dot, and a literal "\s*" after the currency would miss every one of them.
-    r"(?:(?:bdt|tk|taka|৳)\.?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
-    r"|([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:bdt|tk|taka|৳))",
-    re.IGNORECASE,
-)
 # The clause a security warning runs to (end of sentence/line).
 _WARNING_END_RE = re.compile(r"[.!?\n]")
+# A currency amount or a balance. A message carrying one of these and no OTP
+# keyword is a receipt, and the long digit runs in it are not a code.
+_MONEY_RE = re.compile(
+    r"(?<![a-z])(?:tk|taka|bdt|৳)(?![a-z])|\bbalance\b", re.IGNORECASE
+)
 # How close a code must sit to a warning-covered OTP keyword before it counts as
 # that keyword's code ("Do not share your OTP 123456 with anyone").
 _OTP_WARNING_WINDOW = 24
@@ -122,16 +117,13 @@ LABELED_DIRECT_RE = re.compile(
 class ParsedSms:
     """One message's routing decision.
 
-    ``otp`` is only set for sign-in and payment OTPs, ``trx``/``amount`` only
-    for a completed transaction, so a consumer can never mistake an amount for
-    a code. ``code`` is whichever of the two applies.
+    ``otp`` and ``code`` are only set for a sign-in OTP, so a consumer can
+    never mistake some other number for a code.
     """
 
     kind: str = KIND_UNKNOWN
     code: str = ""
     otp: str = ""
-    trx: str = ""
-    amount: str = ""
     sender: str = ""
     sender_number: str = ""
     reason: str = ""
@@ -140,7 +132,6 @@ class ParsedSms:
 @dataclass(frozen=True)
 class Brand:
     label: str
-    family: str
     pattern: "re.Pattern"
 
 
@@ -148,8 +139,7 @@ class Brand:
 class SmsPatterns:
     brands: Tuple[Brand, ...]
     keywords: Dict[str, Tuple["re.Pattern", ...]]
-    trx_anchor: "re.Pattern"
-    senders: Dict[str, Dict[str, str]]
+    senders: Dict[str, str]
     source: str = ""
 
 
@@ -197,17 +187,12 @@ def build_patterns(data: dict, source: str = "") -> SmsPatterns:
         if not isinstance(entry, dict):
             raise ValueError("each brand must be an object")
         label = str(entry.get("label") or "").strip()
-        family = str(entry.get("family") or "").strip()
         aliases = entry.get("aliases")
         if not label:
             raise ValueError("every brand needs a 'label'")
-        if family not in DELIVERY_KINDS:
-            raise ValueError(
-                f"brand {label!r} has family {family!r}; expected one of {DELIVERY_KINDS}"
-            )
         if not isinstance(aliases, list) or not any(str(a).strip() for a in aliases):
             raise ValueError(f"brand {label!r} needs at least one alias")
-        brands.append(Brand(label=label, family=family, pattern=_alternation(str(a) for a in aliases)))
+        brands.append(Brand(label=label, pattern=_alternation(str(a) for a in aliases)))
 
     raw_keywords = data.get("keywords")
     if not isinstance(raw_keywords, dict) or not raw_keywords.get("otp"):
@@ -218,27 +203,19 @@ def build_patterns(data: dict, source: str = "") -> SmsPatterns:
             raise ValueError(f"keywords.{name} must be a list")
         keywords[name] = tuple(_phrase_pattern(str(p)) for p in phrases if str(p).strip())
 
-    anchors = data.get("trx_anchors")
-    if not isinstance(anchors, list) or not anchors:
-        raise ValueError("SMS patterns need a non-empty 'trx_anchors' list")
-
     raw_senders = data.get("senders") or {}
     if not isinstance(raw_senders, dict):
         raise ValueError("'senders' must be an object")
     senders = {}
-    for address, meta in raw_senders.items():
-        if not isinstance(meta, dict):
-            raise ValueError(f"sender {address!r} must map to an object")
-        label = str(meta.get("label") or "").strip()
-        family = str(meta.get("family") or "").strip()
-        if not label or family not in DELIVERY_KINDS:
-            raise ValueError(f"sender {address!r} needs 'label' and a valid 'family'")
-        senders[str(address).strip().upper()] = {"label": label, "family": family}
+    for address, raw_label in raw_senders.items():
+        label = str(raw_label or "").strip()
+        if not label:
+            raise ValueError(f"sender {address!r} needs a 'label'")
+        senders[str(address).strip().upper()] = label
 
     return SmsPatterns(
         brands=tuple(brands),
         keywords=keywords,
-        trx_anchor=_alternation(anchors, flags=re.IGNORECASE),
         senders=senders,
         source=source,
     )
@@ -664,36 +641,6 @@ def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
     return ""
 
 
-def extract_trx_id(message, patterns: Optional[SmsPatterns] = None) -> str:
-    """The transaction ID that follows a ``TrxID`` / ``Txn ID`` anchor.
-
-    The candidate must contain a digit, which is what stops "Transaction ID has
-    not been generated" from yielding the word "generated".
-    """
-    patterns = patterns or get_patterns()
-    text = normalize_text(message)
-
-    for anchor in patterns.trx_anchor.finditer(text):
-        window = text[anchor.end() : anchor.end() + 24]
-        for token in _TRX_TOKEN_RE.finditer(window):
-            value = token.group(0)
-            if any(char.isdigit() for char in value):
-                return value
-    return ""
-
-
-def extract_amount(message) -> str:
-    """The first currency-anchored amount, normalised to two decimals."""
-    match = _AMOUNT_RE.search(normalize_text(message))
-    if not match:
-        return ""
-    raw = (match.group(1) or match.group(2) or "").replace(",", "")
-    try:
-        return str(Decimal(raw).quantize(Decimal("0.01")))
-    except (InvalidOperation, ValueError):
-        return ""
-
-
 def _detect_brand(
     text: str,
     patterns: SmsPatterns,
@@ -702,9 +649,8 @@ def _detect_brand(
     """The brand a message is about, or ``None``.
 
     ``anchor`` is the OTP keyword's span. With it, the brand *nearest the
-    keyword* wins instead of the first one listed: a payment OTP names its
-    merchant too ("Your bKash OTP for PAYMENT of Tk 3,000.00 to IVAC ..."),
-    and only proximity tells the wallet apart from the payee.
+    keyword* wins instead of the first one listed: a message can name a
+    gateway and a merchant, and only proximity tells them apart.
     """
     if not text:
         return None
@@ -741,8 +687,8 @@ def _sender_digits(value) -> str:
     return digits.lstrip("0")
 
 
-def _lookup_sender(raw_sender: str, patterns: SmsPatterns) -> Optional[Dict[str, str]]:
-    """The brand a sender address belongs to (wallet shortcode, IVAC id, ...)."""
+def _lookup_sender(raw_sender: str, patterns: SmsPatterns) -> Optional[str]:
+    """The label a sender address belongs to (IVAC id, IVACBD, ...)."""
     if not raw_sender:
         return None
     key = raw_sender.strip().upper()
@@ -751,9 +697,9 @@ def _lookup_sender(raw_sender: str, patterns: SmsPatterns) -> Optional[Dict[str,
 
     digits = _sender_digits(raw_sender)
     if digits:
-        for address, meta in patterns.senders.items():
+        for address, label in patterns.senders.items():
             if _sender_digits(address) == digits:
-                return meta
+                return label
     return None
 
 
@@ -762,7 +708,7 @@ def parse_sms(
     sender=None,
     patterns: Optional[SmsPatterns] = None,
 ) -> ParsedSms:
-    """Classify one SMS into a channel and pull out its code and sender.
+    """Classify one SMS as a sign-in OTP and pull out its code and sender.
 
     ``sender`` is the address the forwarder posted. It is used for the label and
     as a fallback hint only; the body is what decides, because providers change
@@ -780,108 +726,68 @@ def parse_sms(
     sender_brand = _detect_brand(raw_sender.lower(), patterns)
 
     if body_brand:
-        family, sender_label = body_brand.family, body_brand.label
+        family, sender_label = KIND_SIGNIN, body_brand.label
     elif mapped_sender:
-        family, sender_label = mapped_sender["family"], mapped_sender["label"]
+        family, sender_label = KIND_SIGNIN, mapped_sender
     elif sender_brand:
-        family, sender_label = sender_brand.family, sender_brand.label
+        family, sender_label = KIND_SIGNIN, sender_brand.label
     else:
         family, sender_label = "", raw_sender
 
     otp = extract_otp_code(text, patterns)
-    trx = extract_trx_id(text, patterns)
-    amount = extract_amount(text)
-
     signin_keyword = _first_keyword(lower, patterns.keywords.get("signin", ()))
-    payment_keyword = _first_keyword(lower, patterns.keywords.get("payment", ()))
 
-    # MFS (Mobile Financial Services) detection:
-    # A message is from an MFS payment provider if body or sender matches a payment brand/shortcode.
-    sender_is_mfs = (mapped_sender and mapped_sender["family"] == KIND_PAYMENT) or (
-        sender_brand and sender_brand.family == KIND_PAYMENT
-    )
-    body_is_mfs = bool(body_brand and body_brand.family == KIND_PAYMENT)
-    is_mfs = sender_is_mfs or body_is_mfs
-
-    # A wallet message can name only its payee: "Your OTP for PAYMENT of
-    # Tk.3,000.00 to IVAC (DGePay) is 319805" is bKash's payment OTP, and
-    # the only brand in the body belongs to the merchant. The forwarder's
-    # sender number or brand is what says which wallet actually sent it.
-    if family == KIND_SIGNIN and sender_is_mfs and payment_keyword:
-        family = KIND_PAYMENT
-        sender_label = (mapped_sender and mapped_sender["label"]) or (
-            sender_brand and sender_brand.label
-        ) or "bKash"
-        is_mfs = True
+    # A receipt is not an OTP: "Payment of Tk 3,000.00 ... Balance Tk 11,620.91"
+    # holds enough digit runs to be read as a code, and none of them is one. Only
+    # an OTP keyword makes a money message an OTP.
+    if otp and not otp_keyword and _MONEY_RE.search(lower):
+        otp = ""
 
     kind = KIND_UNKNOWN
-    reason = "no OTP or transaction identifier found"
+    reason = "no OTP found"
 
-    # 1. First, check if it is an MFS transaction or payment OTP
-    if is_mfs or trx:
-        if otp and otp_keyword and family == KIND_PAYMENT:
-            kind, reason = KIND_PAYMENT, "payment OTP (brand or sender says payment)"
-        elif trx:
-            kind, reason = KIND_TRANSACTION, "transaction ID"
-            if not sender_label or sender_label == raw_sender:
-                if mapped_sender:
-                    sender_label = mapped_sender["label"]
-                elif sender_brand:
-                    sender_label = sender_brand.label
-        elif otp and otp_keyword:
-            kind, reason = KIND_PAYMENT, "payment OTP (MFS payment OTP)"
-        elif otp:
-            reason = "code found but the body never calls it an OTP"
-    else:
-        # 2. Not from MFS: if an OTP sequence / code is found, route to IVAC sign-in OTP
-        has_otp_sequence = bool(
-            otp
-            and (
-                otp_keyword
-                or _number_word_run(lower)
-                or _extract_labeled_otp(text)
-                or _separated_alnum_run(text)
-                or _separated_span(text)
-                or _extract_alphanumeric_otp(text)
-                or _compound_word_run(lower)
-                or _extract_alphabet_only_otp(text)
-                or re.fullmatch(r"[A-Za-z0-9]{4,8}", text.strip())
-                or family == KIND_SIGNIN
-                or signin_keyword
-            )
+    # An OTP sequence / code is what makes a message a sign-in OTP.
+    has_otp_sequence = bool(
+        otp
+        and (
+            otp_keyword
+            or _number_word_run(lower)
+            or _extract_labeled_otp(text)
+            or _separated_alnum_run(text)
+            or _separated_span(text)
+            or _extract_alphanumeric_otp(text)
+            or _compound_word_run(lower)
+            or _extract_alphabet_only_otp(text)
+            or re.fullmatch(r"[A-Za-z0-9]{4,8}", text.strip())
+            or family == KIND_SIGNIN
+            or signin_keyword
         )
+    )
 
-        if has_otp_sequence and otp:
-            kind = KIND_SIGNIN
-            if family == KIND_SIGNIN:
-                reason = "sign-in OTP (brand or sender says sign-in)"
-            elif signin_keyword:
-                reason = "sign-in OTP (sign-in vocabulary in body)"
-            else:
-                reason = "sign-in OTP (IVAC default for non-MFS OTP)"
+    if has_otp_sequence and otp:
+        kind = KIND_SIGNIN
+        if family == KIND_SIGNIN:
+            reason = "sign-in OTP (brand or sender says sign-in)"
+        elif signin_keyword:
+            reason = "sign-in OTP (sign-in vocabulary in body)"
+        else:
+            reason = "sign-in OTP (no provider brand in the body)"
 
-            # Ensure sender is labeled as IVAC if unknown or unmapped
-            if not sender_label or sender_label == raw_sender or sender_label not in ("IVAC", "IVACBD"):
-                sender_label = "IVAC"
-        elif otp:
-            reason = "code found but the body never calls it an OTP"
+        # An unmapped sender echoes its own address; label those as IVAC.
+        if not sender_label or sender_label == raw_sender:
+            sender_label = "IVAC"
+    elif otp:
+        reason = "code found but the body never calls it an OTP"
 
-    # Only publish the fields that belong to the chosen channel: an "unknown"
-    # message must not hand a consumer a neighbouring number as if it were an
-    # OTP, and an amount must never masquerade as one.
-    if kind == KIND_TRANSACTION:
+    # An "unknown" message must not hand a consumer a neighbouring number as
+    # if it were an OTP.
+    if kind != KIND_SIGNIN:
         otp = ""
-    elif kind in (KIND_SIGNIN, KIND_PAYMENT):
-        trx, amount = "", ""
-    else:
-        otp = trx = amount = ""
 
     return ParsedSms(
         kind=kind,
-        code=otp or trx,
+        code=otp,
         otp=otp,
-        trx=trx,
-        amount=amount,
         sender=sender_label,
         sender_number=raw_sender,
         reason=reason,

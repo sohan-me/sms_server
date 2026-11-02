@@ -1,69 +1,29 @@
 {
-  "version": 1,
+  "version": 2,
   "_comment": [
-    "Classification rules for the signin / payment / transaction SMS channels.",
+    "Classification rules for the sign-in OTP SMS channel.",
     "sms_parser.py reloads this file when its mtime changes, so a provider that",
     "changes its wording or separators can be handled by editing this file and",
     "restarting the workers — no code change, no redeploy.",
     "",
     "brands: matched against the message body first, then against the sender",
-    "  address (which the SMS forwarder posts as `sender`). A brand decides the",
-    "  family; the first matching entry wins, so keep the most specific first.",
+    "  address (which the SMS forwarder posts as `sender`). A brand only labels",
+    "  the message, it never changes routing. The first matching entry wins, so",
+    "  keep the most specific first.",
     "keywords.otp: a message needs one of these plus an extractable code before",
     "  it can be an OTP at all. Add wording here when a provider changes it.",
     "keywords.signin: sign-in vocabulary, used when the sender/brand is unknown.",
-    "keywords.payment: payment vocabulary. A wallet's OTP may name only the",
-    "  merchant (\"OTP for PAYMENT ... to IVAC\"), so this plus a wallet sender",
-    "  is what tells a payment OTP from a sign-in one.",
     "keywords.warning: security-warning wording. An OTP keyword inside one of",
-    "  these clauses is not an OTP announcement — wallets print the same line on",
-    "  transaction SMS, where it would otherwise be read as the OTP.",
-    "trx_anchors: the labels a transaction ID follows. The token right after the",
-    "  anchor is read as the TRX ID.",
-    "senders: sender addresses (wallet shortcodes, gateway numbers) mapped to a",
-    "  brand. The forwarder posts the SMS sender address, so this is what labels",
-    "  messages whose body never names the provider — a Rocket transaction, for",
-    "  example, only says \"Tk4,500.00 paid ... TxnId:\". Keys are compared",
-    "  case-insensitively and, for numeric addresses, digit for digit after",
-    "  dropping a 880 country code. Add a new shortcode here; routing is decided",
-    "  by the body whenever the body names a brand."
+    "  these clauses is not an OTP announcement — providers print the same line",
+    "  on unrelated SMS, where it would otherwise be read as the OTP.",
+    "senders: sender addresses (gateway numbers, sender IDs) mapped to a label.",
+    "  Keys are compared case-insensitively and, for numeric addresses, digit",
+    "  for digit after dropping a 880 country code."
   ],
   "brands": [
     {
       "label": "IVAC",
-      "family": "signin",
       "aliases": ["ivac", "i-vac", "ivacbd", "ivac bd"]
-    },
-    {
-      "label": "bKash",
-      "family": "payment",
-      "aliases": ["bkash", "b-kash"]
-    },
-    {
-      "label": "Nagad",
-      "family": "payment",
-      "aliases": ["nagad"]
-    },
-    {
-      "label": "DBBL",
-      "family": "payment",
-      "aliases": [
-        "dbbl",
-        "dutch-bangla bank",
-        "dutch bangla bank",
-        "dutch-bangla",
-        "dutch bangla"
-      ]
-    },
-    {
-      "label": "Rocket",
-      "family": "payment",
-      "aliases": ["rocket"]
-    },
-    {
-      "label": "Upay",
-      "family": "payment",
-      "aliases": ["upay", "u-pay"]
     }
   ],
   "keywords": {
@@ -109,14 +69,6 @@
       "following sequence",
       "when prompted"
     ],
-    "payment": [
-      "payment",
-      "paid",
-      "purchase",
-      "e-commerce",
-      "ecommerce",
-      "ecom"
-    ],
     "warning": [
       "do not share",
       "don't share",
@@ -128,25 +80,8 @@
       "do not provide"
     ]
   },
-  "trx_anchors": [
-    "transaction number",
-    "transaction id",
-    "transaction no",
-    "transactionid",
-    "trx id",
-    "trx no",
-    "trxid",
-    "txn id",
-    "txn no",
-    "txnid",
-    "trx",
-    "txn"
-  ],
   "senders": {
-    "16216": { "label": "Rocket", "family": "payment" },
-    "16247": { "label": "bKash", "family": "payment" },
-    "16167": { "label": "Nagad", "family": "payment" },
-    "IVACBD": { "label": "IVAC", "family": "signin" },
-    "IVAC": { "label": "IVAC", "family": "signin" }
+    "IVACBD": "IVAC",
+    "IVAC": "IVAC"
   }
 }

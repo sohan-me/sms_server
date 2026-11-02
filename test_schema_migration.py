@@ -37,7 +37,6 @@ OTP_COLUMNS = {
     "sender",
     "sender_number",
     "code",
-    "amount",
     "created_at",
     "updated_at",
     "revision",
@@ -144,22 +143,12 @@ class SchemaMigrationTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row, ("01712345678", "signin", "", 10))
 
-        # The whole point: a payment OTP for the same number now coexists.
-        conn.execute(
-            "INSERT INTO otp_message "
-            "(phone, kind, otp_message, message_pub, sender, sender_number, code, revision) "
-            "VALUES ('01712345678', 'payment', 'bKash OTP 123456', 'IVAC', 'bKash', 'bKash', '123456', 11)"
-        )
-        conn.commit()
-        self.assertEqual(
-            conn.execute("SELECT COUNT(*) FROM otp_message").fetchone()[0], 2
-        )
-
+        # The composite key is still what stops a second row for the same kind.
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO otp_message "
                 "(phone, kind, otp_message, message_pub, sender, sender_number, code, revision) "
-                "VALUES ('01712345678', 'payment', 'duplicate', 'IVAC', '', '', '', 12)"
+                "VALUES ('01712345678', 'signin', 'duplicate', 'IVAC', '', '', '', 11)"
             )
 
     def test_legacy_rebuild_drops_columns_the_schema_no_longer_has(self):
@@ -241,24 +230,14 @@ class SchemaMigrationTests(unittest.TestCase):
         # Exactly one unique key, from the model constraint -- no duplicate
         # index created by the migration on top of it.
         self.assertEqual([key for key, _ in self.unique_keys()], [("phone", "kind")])
-        self.assertEqual(
-            [key for key, _ in self.unique_keys("payment_transaction")],
-            [("phone", "trx_id")],
-        )
-
+        # The payment tables are gone from the schema entirely.
         conn = self.connect()
-        conn.execute(
-            "INSERT INTO payment_transaction "
-            "(phone, trx_id, amount, sender, sender_number, raw_message) "
-            "VALUES ('01712345678', '9HABCDEFG1', '500.00', 'bKash', 'bKash', 'TrxID 9HABCDEFG1')"
-        )
-        conn.commit()
-        with self.assertRaises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO payment_transaction "
-                "(phone, trx_id, amount, sender, sender_number, raw_message) "
-                "VALUES ('01712345678', '9HABCDEFG1', '500.00', 'bKash', 'bKash', 'retry')"
-            )
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        self.assertNotIn("payment_transaction", tables)
+        self.assertNotIn("payment_number", tables)
 
     def test_legacy_revision_cursor_is_preserved(self):
         self.legacy_db(

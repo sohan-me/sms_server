@@ -60,112 +60,56 @@ Each OTP arrives as a separate WebSocket message:
 
 Use `phone` to identify which number received the OTP.
 
-## Channels
+## Sign-in OTP channel
 
-One ingest endpoint feeds three channels, each with its own WebSocket and HTTP
-endpoint. The channel is decided from the message **body**; the sender address is
-only a label, so a provider changing its sender number cannot break routing.
+One ingest endpoint feeds one channel. The classification is decided from the
+message **body**; the sender address is only a label, so a provider changing its
+sender number cannot break routing.
 
-| Channel | WebSocket | HTTP | Code field |
+| What | WebSocket | HTTP | Code field |
 |---|---|---|---|
 | Sign-in OTP (IVAC) | `/ws/otp/signin` | `GET /api/signin/<phone>` | `otp` |
-| Payment OTP (bKash, Nagad, DBBL, Rocket, Upay) | `/ws/otp/payment` | `GET /api/payment/<phone>?token=…` | `otp` |
-| Transaction ID after payment | `/ws/otp/transaction` | `GET /api/transaction/<phone>?token=…` | `trx` |
-| Transaction history | — | `GET /api/transaction/<phone>/history?limit=50&token=…` | — |
+| Legacy sign-in socket | `/ws/otp` | `GET /api/messages/<phone>` | `otp` |
 
-Auth and `subscribe` are identical on all three sockets; only the path changes, and
-each connection only ever receives its own channel's frames even when several
-channels watch the same number.
+Auth and `subscribe` are identical on both sockets; only the path changes.
+Payment OTPs and transaction receipts are no longer served: there is no
+`/ws/otp/payment`, `/ws/otp/transaction` or `/api/payment/*` /
+`/api/transaction/*` endpoint any more.
 
-### Payment numbers are claimed first
-
-Payment and transaction traffic is private per device, so a device declares the
-numbers it will pay from before paying. `POST /api/payment/numbers` with the
-`ws_token` claims them; `GET` lists them with each number's `payment_count`, and
-`DELETE /api/payment/numbers/<phone>` releases one:
-
-```http
-POST /api/payment/numbers?token=<ws_token>
-Content-Type: application/json
-
-{ "numbers": ["01712345678"] }
-```
-
-```json
-{ "numbers": [ { "phone": "01712345678", "payment_count": 0 } ] }
-```
-
-From then on, that number's payment OTPs and transactions reach only this
-device's sockets and `?token=` HTTP reads — another user subscribed to the same
-number gets nothing, and a number already claimed by someone else answers `409`.
-An arrival for an unclaimed number is stored but delivered to nobody. Sign-in is
-unchanged and needs no claim.
-
-Numbers belong to the device, not to a token, so a rotated `ws_token` never loses
-them. Send the device fingerprint (`mac_address`, `motherboard_serial`,
-`machine_guid`, `bios_serial` — any two) with the claim and the number is bound
-to that machine. If rotation re-issued the machine as a new device row, the same
-fingerprint brings the number back, counter and all, with `"reclaimed": […]` in
-the response; a different fingerprint still answers `409`.
-
-`payment_count` counts completed payments per number: `1` for the first file paid
-with it, `2` for the next with the same number, and a repeated TRX ID does not
-count again.
+A delivered sign-in frame:
 
 ```json
 {
-  "kind": "payment",
+  "kind": "signin",
   "otp": "123456",
-  "payment_count": 0,
   "phone": "01712345678",
   "receiver": "01712345678",
-  "sender": "bKash",
+  "sender": "IVAC",
   "sender_number": "8801XXXXXXXXX",
   "last_updated": "2026-10-29T12:00:00.000+06:00"
 }
 ```
 
-A transaction frame carries `trx` (and `amount` when the body has one) and **no**
-`otp`, so an amount can never be mistaken for a code:
-
-```json
-{
-  "kind": "transaction",
-  "trx": "9HABCDEFG1",
-  "amount": "500.00",
-  "payment_count": 1,
-  "phone": "01712345678",
-  "receiver": "01712345678",
-  "sender": "bKash",
-  "sender_number": "8801XXXXXXXXX",
-  "last_updated": "2026-10-29T12:00:00.000+06:00"
-}
-```
-
-`GET /api/transaction/<phone>/history` returns `{"transactions": [...]}` newest
-first; the latest-only endpoints return `{}` when nothing is in the retention
-window, like `/api/messages/<phone>` always has.
+A newer OTP for the same number replaces the stored code and is pushed to every
+subscriber. `GET /api/signin/<phone>` returns `{}` when nothing is in the
+retention window, like `/api/messages/<phone>` always has.
 
 **Compatibility.** `/ws/otp` and `GET /api/messages/<phone>` are unchanged aliases
 for the sign-in channel: same auth, same `subscribe` protocol, and a frame with
 exactly `otp`, `phone`, `last_updated`. Existing clients need no change.
 
 The forwarder posts the receiving SIM as `receiver` and the SMS sender address as
-`sender` (`phone` is still accepted as the older name for the receiver). The sender
-address improves the label and resolves templates whose body omits the brand, so a
-Rocket transaction — which never names Rocket — is still labelled and routed:
+`sender` (`phone` is still accepted as the older name for the receiver):
 
 ```json
-{ "receiver": "01712345678", "message": "...", "sender": "16216" }
+{ "receiver": "01712345678", "message": "...", "sender": "IVACBD" }
 ```
 
-The wallet shortcodes `16216` (Rocket), `16247` (bKash) and `16167` (Nagad) are
-mapped in `sms_patterns.json` under `senders`; add any new sender address there.
-
-Messages that match no channel are stored as `unknown` (so they can be inspected)
-and are pushed to no socket. The parsers and their separators live in
-`sms_patterns.json`; a provider changing its wording or the `-` → `_` separator is
-a file edit, not a code change.
+Messages with no OTP keyword are stored as `unknown` (so they can be inspected)
+and are pushed to no socket; a payment receipt such as "Payment of Tk 3,000.00 …
+Balance Tk 11,620.91" is one of them, so its digit runs can never be served as a
+code. The parsers and their separators live in `sms_patterns.json`; a provider
+changing its wording or the `-` → `_` separator is a file edit, not a code change.
 
 ## Important
 
@@ -368,12 +312,11 @@ by threads, not by the SQLAlchemy pool (which is only 5 + 10 overflow by default
 Size `WEB_THREADS` — not the product of workers and threads — against the peak:
 
 ```text
-WEB_THREADS  >=  (3 x peak concurrent users) + headroom
+WEB_THREADS  >=  (2 x peak concurrent users) + headroom
 ```
 
-Three because each user opens one socket per channel — `/ws/otp/signin`,
-`/ws/otp/payment`, `/ws/otp/transaction` (plus one more if an old client still uses
-`/ws/otp`). The headroom matters as much as the multiplier: when sockets fill every
+Two because a user may hold `/ws/otp/signin` plus the legacy `/ws/otp`. The
+headroom matters as much as the multiplier: when sockets fill every
 thread, nothing is left to answer `/api/health` or accept `POST /api/messages` — at
 64 sockets on 1 x 64 threads both failed while the sockets themselves stayed up.
 

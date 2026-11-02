@@ -42,13 +42,16 @@ module.exports = {
         // measured, 3 workers x 16 threads stalled at 16 sockets because one
         // worker absorbed every connection.
         //
-        // Target: 15 users x 3 sockets (signin, payment, transaction) = 45, plus
-        // 5 threads of headroom so ingest and /api/health still answer when one
-        // worker happens to hold every socket. Measured at 4 x 50 with all 45
+        // Sign-in is the only channel now, so a user holds one socket
+        // (/ws/otp/signin), plus /ws/otp only if they still run a legacy client.
+        // 15 users is therefore 15–30 sockets, and 50 threads per worker covers
+        // that with headroom so ingest and /api/health still answer when one
+        // worker happens to hold every socket. Measured at 4 x 50 with 45
         // sockets open: health 5ms, SMS ingest 13ms, counters correct — the 45
         // all landed on one worker, which is the case this headroom covers. Do
-        // not trim to 45: that leaves nothing to accept POST /api/messages on
-        // the worker holding the sockets, and the failure is intermittent.
+        // not trim threads to the exact socket count: that leaves nothing to
+        // accept POST /api/messages on the worker holding the sockets, and the
+        // failure is intermittent.
         // 4 workers x 50 threads = 200 threads; stack memory stays small.
         WEB_CONCURRENCY: "4",
         WEB_THREADS: "50",

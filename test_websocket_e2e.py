@@ -448,13 +448,11 @@ class WebSocketEndToEndTests(unittest.TestCase):
             if second_server.stdout:
                 second_server.stdout.close()
 
-    def test_channels_are_isolated_across_ws_and_http(self):
+    def test_signin_otp_reaches_the_sockets_and_http(self):
         phone = "01730000001"
         base = f"ws://127.0.0.1:{self.port}"
         ws_paths = {
             "signin": f"{base}/ws/otp/signin?token={self.token}",
-            "payment": f"{base}/ws/otp/payment?token={self.token}",
-            "transaction": f"{base}/ws/otp/transaction?token={self.token}",
             "legacy": f"{base}/ws/otp?token={self.token}",
         }
 
@@ -481,18 +479,6 @@ class WebSocketEndToEndTests(unittest.TestCase):
                 "Your IVAC verification code is ONE_TWO_THREE_FOUR_FIVE_SIX",
                 sender="8801999999999",
             )
-            self._post_sms(
-                self.port,
-                phone,
-                "Your bKash OTP is 456789. Do not share it.",
-                sender="bKash",
-            )
-            self._post_sms(
-                self.port,
-                phone,
-                "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1.",
-                sender="bKash",
-            )
 
             received = [result_queue.get(timeout=10) for _ in range(len(ws_paths))]
             self.assertEqual({item[0] for item in received}, {"result"})
@@ -506,23 +492,8 @@ class WebSocketEndToEndTests(unittest.TestCase):
             self.assertEqual(signin_frame["receiver"], phone)
             self.assertEqual(signin_frame["sender"], "IVAC")
             self.assertEqual(signin_frame["sender_number"], "8801999999999")
-            self.assertNotIn("trx", signin_frame)
 
-            self.assertEqual(len(by_label["payment"]), 1)
-            payment_frame = by_label["payment"][0]
-            self.assertEqual(payment_frame["kind"], "payment")
-            self.assertEqual(payment_frame["otp"], "456789")
-            self.assertEqual(payment_frame["sender"], "bKash")
-            self.assertNotIn("trx", payment_frame)
-
-            self.assertEqual(len(by_label["transaction"]), 1)
-            transaction_frame = by_label["transaction"][0]
-            self.assertEqual(transaction_frame["kind"], "transaction")
-            self.assertEqual(transaction_frame["trx"], "9HABCDEFG1")
-            self.assertEqual(transaction_frame["amount"], "500.00")
-            self.assertNotIn("otp", transaction_frame)
-
-            # The legacy socket receives sign-in only, in the original shape.
+            # The legacy socket receives the same OTP in the original shape.
             self.assertEqual(len(by_label["legacy"]), 1)
             legacy_frame = by_label["legacy"][0]
             self.assertEqual(sorted(legacy_frame), ["last_updated", "otp", "phone"])
@@ -533,43 +504,9 @@ class WebSocketEndToEndTests(unittest.TestCase):
             self.assertEqual(signin["sender"], "IVAC")
             self.assertEqual(signin["receiver"], phone)
 
-            # Payment and transaction reads are private now, so even this
-            # script asks with the server-wide token.
-            payment = self._get_json(
-                self.port, f"/api/payment/{phone}?token={self.token}"
-            )
-            self.assertEqual(payment["otp"], "456789")
-            self.assertEqual(payment["sender"], "bKash")
-
-            transaction = self._get_json(
-                self.port, f"/api/transaction/{phone}?token={self.token}"
-            )
-            self.assertEqual(transaction["trx"], "9HABCDEFG1")
-            self.assertNotIn("otp", transaction)
-
             legacy = self._get_json(self.port, f"/api/messages/{phone}")
             self.assertEqual(sorted(legacy), ["last_updated", "message"])
             self.assertEqual(legacy["message"], "123456")
-
-            history = self._get_json(
-                self.port, f"/api/transaction/{phone}/history?token={self.token}"
-            )
-            self.assertEqual(
-                [item["trx"] for item in history["transactions"]],
-                ["9HABCDEFG1"],
-            )
-
-            # A forwarder retry must not duplicate the recorded payment.
-            self._post_sms(
-                self.port,
-                phone,
-                "You have received Tk 500.00 from 01711111111. TrxID 9HABCDEFG1.",
-                sender="bKash",
-            )
-            history = self._get_json(
-                self.port, f"/api/transaction/{phone}/history?token={self.token}"
-            )
-            self.assertEqual(len(history["transactions"]), 1)
 
             self.assertEqual(
                 self._get_json(self.port, "/api/signin/01700000000"),
