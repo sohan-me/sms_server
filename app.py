@@ -182,7 +182,7 @@ def _extract_normalized_otp(raw):
     if not text:
         return ""
 
-    # 1) Number-word run (≥4 words): Five-Six-Nine-One-Two-Five → 569125
+    # 1) Number-word run (4–8 words): Five-Six-Nine-One-Two-Five → 569125
     tokens = re.findall(r"[a-z]+", text.lower())
     best = []
     current = []
@@ -190,26 +190,30 @@ def _extract_normalized_otp(raw):
         if tok in NUMBER_WORD_TO_DIGIT:
             current.append(NUMBER_WORD_TO_DIGIT[tok])
         else:
-            if len(current) > len(best):
+            if 4 <= len(current) <= 8 and len(current) > len(best):
                 best = current
             current = []
-    if len(current) > len(best):
+    if 4 <= len(current) <= 8 and len(current) > len(best):
         best = current
-    if len(best) >= 4:
+    if 4 <= len(best) <= 8:
         return "".join(best)
 
     # 2) Spaced/hyphenated digits: 2-5-7-0-0-7
-    spaced = re.findall(r"(?:\d[\s\-]+){3,}\d", text)
+    spaced = re.findall(r"(?:\d[\s\-_.\+/]+){3,7}\d", text)
     if spaced:
-        return re.sub(r"\D", "", spaced[-1])
+        candidate = re.sub(r"\D", "", spaced[-1])
+        if 4 <= len(candidate) <= 8:
+            return candidate
 
-    # 3) Contiguous 4–8 digit block (last match), else longest digit run
+    # 3) Contiguous 4–8 digit block (last match), else longest 4-8 digit run
     blocks = re.findall(r"\d{4,8}", text)
     if blocks:
         return blocks[-1]
     runs = re.findall(r"\d+", text)
     if runs:
-        return max(runs, key=len)
+        candidate = max(runs, key=len)
+        if 4 <= len(candidate) <= 8:
+            return candidate
 
     return ""
 
