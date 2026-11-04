@@ -548,6 +548,78 @@ class AllOtpFormatsTests(unittest.TestCase):
         self.assertEqual(extract_otp_code("A B C D", PATTERNS), "")
         self.assertNotEqual(extract_otp_code("IVAC code: A 1 g 0", PATTERNS), "A1g0A")
 
+    def test_comprehensive_four_to_eight_digit_and_alphanumeric_patterns(self):
+        cases = (
+            # 1. Worded digits with various separators (-, +, ., /, space, *, ~, :) - lengths 4 to 8
+            ("security, sequence: One-Two-Three-Four", "1234"),
+            ("security, sequence: Two+Five*Seven.Zero/One", "25701"),
+            ("security, sequence: Four_Zero_Three_Seven_Two_Four", "403724"),
+            ("security, type the following sequence when prompted Two-Five+Seven.Zero/Zero Zero One", "2570001"),
+            ("security, sequence: Eight:Seven:Six:Five:Four:Three:Two:One", "87654321"),
+            ("Two-5+Seven.0/Zero Zero 1", "2570001"),
+            ("One+Two*Three~Four", "1234"),
+            ("Nine/Eight/Seven/Six/Five", "98765"),
+            # 2. Labeled numeric OTP - lengths 4 to 8
+            ("Your OTP is 4821", "4821"),
+            ("Your OTP is 54321", "54321"),
+            ("Your verification code is 987654", "987654"),
+            ("Your security code: 1234567", "1234567"),
+            ("Your passcode: 12345678", "12345678"),
+            ("type the following sequence when prompted: 48215", "48215"),
+            # 3. Labeled alphanumeric OTP - lengths 4 to 8
+            ("Your OTP is 12Ab", "12Ab"),
+            ("Your code is Ab12C", "Ab12C"),
+            ("Your passcode: Ab12Cd", "Ab12Cd"),
+            ("Your verification code: Ab76gTf", "Ab76gTf"),
+            ("Your login code is A1B2C3D4", "A1B2C3D4"),
+            # 4. Separated alphanumeric OTP (grouped & char-by-char) - lengths 4 to 8
+            ("IVAC code: A-1-g-0", "A1g0"),
+            ("IVAC code: 12-AB", "12AB"),
+            ("IVAC code: AB-12", "AB12"),
+            ("IVAC code: A1-g0-G", "A1g0G"),
+            ("IVAC code: 12-AB-3", "12AB3"),
+            ("IVAC code: AB-12-CD", "AB12CD"),
+            ("IVAC code: A1-g0-Gi", "A1g0Gi"),
+            ("IVAC code: A1-g0-Ab", "A1g0Ab"),
+            ("IVAC code: 12-AB-34", "12AB34"),
+            ("IVAC code: A-1+g.0/G:i*7", "A1g0Gi7"),
+            ("IVAC code: A1g0-Gi7Z", "A1g0Gi7Z"),
+            ("IVAC code: A-1-B-2-C-3-D-4", "A1B2C3D4"),
+            # 5. Spaced / hyphen numeric digits - lengths 4 to 8
+            ("IVAC code: 1-2-3-4", "1234"),
+            ("IVAC code: 1+2+3+4+5", "12345"),
+            ("IVAC code: 1 2 3 4 5 6", "123456"),
+            ("IVAC code: 1/2/3/4/5/6/7", "1234567"),
+            ("IVAC code: 1*2*3*4*5*6*7*8", "12345678"),
+            # 6. Standalone alphanumeric tokens - lengths 4 to 8
+            ("Use A1b2 to log in", "A1b2"),
+            ("Use A1b2C to log in", "A1b2C"),
+            ("Use Ab12Cd to log in", "Ab12Cd"),
+            ("Use Ab76gTf to log in", "Ab76gTf"),
+            ("Use A1b2C3d4 to log in", "A1b2C3d4"),
+            # 7. Prefixed OTPs
+            ("bKash OTP1234", "1234"),
+            ("bKash OTP12345", "12345"),
+            ("IVAC_OTP_1234567", "1234567"),
+            ("IVAC_OTP_12345678", "12345678"),
+            ("IVAC OTP1234A", "1234A"),
+            # 8. Compound worded
+            ("Twenty Three Forty Five", "2345"),
+            ("Ten Eleven Eighty Six", "101186"),
+            ("Twelve Thirty Four Fifty Six", "123456"),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body, expected=expected):
+                extracted = extract_otp_code(body, PATTERNS)
+                self.assertEqual(
+                    extracted,
+                    expected,
+                    f"Failed on pattern: {body!r} -> expected {expected!r}, got {extracted!r}",
+                )
+                parsed = parse_sms(body, patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_SIGNIN)
+                self.assertEqual(parsed.otp, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

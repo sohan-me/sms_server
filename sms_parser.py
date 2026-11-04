@@ -47,8 +47,8 @@ DEFAULT_PATTERNS_FILE = os.path.join(
 _BENGALI_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 
 # The separators providers actually alternate between.
-_SEPARATOR_CHARS = r"\s\-_.·•/,:"
-_SEP_ONLY_RE = re.compile(r"[\s\-_.·•/,:]*")
+_SEPARATOR_CHARS = r"\s\-_.·•/,:\+\*~|#=\\^%&@;!"
+_SEP_ONLY_RE = re.compile(r"[\s\-_.·•/,:\+\*~|#=\\^%&@;!]*")
 _TOKEN_RE = re.compile(r"[a-z]+|\d")
 # The trailing lookahead has to span separators: without it "12 34 56"
 # matches only "12 34" and the span looks like a two-group non-code.
@@ -86,7 +86,10 @@ COMMON_STOP_WORDS = {
     "banking", "mobile", "gateway", "offer", "cashback", "transaction",
     "secret", "detail", "details", "contact", "update", "online",
     "nagad", "bkash", "rocket", "dbbl", "upay", "dutch", "bangla",
-    "code", "pin", "pass", "word", "three", "four", "five", "prize", "today"
+    "code", "pin", "pass", "word", "three", "four", "five", "prize", "today",
+    "is", "in", "to", "for", "by", "on", "at", "an", "the", "be", "do", "no", "if",
+    "or", "as", "so", "up", "and", "of", "it", "my", "me", "we", "he", "us", "are",
+    "enter", "type", "input", "here"
 }
 
 COMPOUND_TENS = {
@@ -107,7 +110,9 @@ LABELED_DIRECT_RE = re.compile(
     r"\b(?:otp|verification\s+code|verify\s+code|security\s+code|login\s+code|"
     r"confirmation\s+code|passcode|password|pin|your\s+code|code|following\s+sequence|"
     r"sequence\s+when\s+prompted|type\s+the\s+following\s+sequence|security\s+sequence)\b"
-    r"[\s:=,\-]*(?:is|are|to|for|when\s+prompted)?[\s:=,\-]*"
+    r"[\s:=,\-\./\+\*]*"
+    r"(?:is|are|to|for|when\s+prompted)?"
+    r"[\s:=,\-\./\+\*]*"
     r"([A-Za-z0-9]{4,8})\b",
     re.IGNORECASE,
 )
@@ -264,7 +269,7 @@ def get_patterns() -> SmsPatterns:
 
 
 def _flush_run(best: List[str], run: List[str], saw_word: bool) -> None:
-    if saw_word and len(run) >= 4 and len(run) > len(best):
+    if saw_word and 4 <= len(run) <= 8 and len(run) > len(best):
         best[:] = run
     run.clear()
 
@@ -305,15 +310,10 @@ def _number_word_run(lower_text: str) -> str:
 
 
 def _group_kind(token: str) -> str:
-    """How one separator-delimited group can take part in a code run.
-
-    ``mixed`` (``A1``, ``Gi7``), ``digits`` (``1234``) and ``char`` (``A``,
-    ``7``) always belong. ``letters`` (``CD``, ``XYZ``) is a code's letter-only
-    tail and only belongs after a mixed group. ``word`` (``code``, ``OTP``,
-    ``is``, ``in``, ``verification``) is what separates the prose from the
-    code and never belongs — the vowel test is what tells a code tail from a
-    short English word, all of which are written with a vowel.
-    """
+    """How one separator-delimited group can take part in a code run."""
+    lower = token.lower()
+    if lower in COMMON_STOP_WORDS:
+        return "word"
     has_letter = any(c.isalpha() for c in token)
     has_digit = any(c.isdigit() for c in token)
     if has_letter and has_digit:
@@ -322,7 +322,7 @@ def _group_kind(token: str) -> str:
         return "digits"
     if len(token) == 1:
         return "char"
-    if len(token) <= 3 and not any(c in "aeiou" for c in token.lower()):
+    if len(token) <= 4:
         return "letters"
     return "word"
 
@@ -357,19 +357,22 @@ def _separated_alnum_run(text: str) -> str:
 
     previous_end = None
     for match in _ALNUM_GROUP_RE.finditer(text):
-        if previous_end is not None and not _SEP_ONLY_RE.fullmatch(
-            text[previous_end:match.start()]
-        ):
+        sep_text = text[previous_end:match.start()] if previous_end is not None else ""
+        if previous_end is not None and not _SEP_ONLY_RE.fullmatch(sep_text):
             flush()
         token = match.group(0)
         kind = _group_kind(token)
+        has_punct_sep = any(c in r"\-_./+*~|#=:" for c in sep_text)
         if kind == "word":
             flush()
         elif kind == "letters":
-            # Only a tail of a code that already showed a mixed group:
-            # "AB12-CD" is a code, "by A1" is prose.
-            if seen_mixed:
+            if seen_mixed or has_punct_sep:
                 current.append(token)
+                seen_mixed = True
+        elif kind == "digits":
+            if current and has_punct_sep and any(c.isalpha() for c in "".join(current)):
+                seen_mixed = True
+            current.append(token)
         else:
             current.append(token)
             seen_mixed = seen_mixed or kind == "mixed"
@@ -472,21 +475,30 @@ def _extract_labeled_otp(text: str) -> str:
     for m in LABELED_DIRECT_RE.finditer(text):
         candidate = m.group(1)
         for prefix in ("otp", "pin", "code"):
-            if candidate.lower().startswith(prefix) and candidate[len(prefix):].isdigit():
-                return candidate[len(prefix):]
+            if candidate.lower().startswith(prefix):
+                rest = candidate[len(prefix):]
+                if 4 <= len(rest) <= 8 and rest.lower() not in COMMON_STOP_WORDS:
+                    return rest
         if candidate.lower() not in COMMON_STOP_WORDS:
             return candidate
     return ""
 
 
 def _extract_alphanumeric_otp(text: str) -> str:
-    """Standalone alphanumeric token: letters + digits, 4-10 chars, any case."""
+    """Standalone alphanumeric token: letters + digits, 4-8 chars, any case."""
+    for m in re.finditer(r"\b(?:otp|pin|code)([A-Za-z0-9]{4,8})\b", text, re.IGNORECASE):
+        candidate = m.group(1)
+        if candidate.lower() not in COMMON_STOP_WORDS:
+            return candidate
+
     for m in _ALPHANUM_RE.finditer(text):
         tok = m.group(0)
         if any(c.isalpha() for c in tok) and any(c.isdigit() for c in tok):
             for prefix in ("otp", "pin", "code"):
-                if tok.lower().startswith(prefix) and tok[len(prefix):].isdigit():
-                    return tok[len(prefix):]
+                if tok.lower().startswith(prefix):
+                    rest = tok[len(prefix):]
+                    if 4 <= len(rest) <= 8 and rest.lower() not in COMMON_STOP_WORDS:
+                        return rest
             if tok.lower() not in COMMON_STOP_WORDS:
                 return tok
     return ""
