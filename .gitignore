@@ -18,3 +18,6 @@ env/
 build/
 dist/
 *.zip
+
+# Flask instance folder (local SQLite test DBs, secrets)
+instance/

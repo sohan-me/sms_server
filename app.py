@@ -806,6 +806,11 @@ def api_add_message():
     if not phone or not message:
         return jsonify({"error": "Missing phone or message"}), 400
 
+    # Read message_pub from request (VFS or IVAC), default to IVAC for backward compat
+    message_pub = (data.get("message_pub") or data.get("messagePub") or "").strip().upper()
+    if message_pub not in ("VFS", "IVAC"):
+        message_pub = DEFAULT_MESSAGE_PUB
+
     message = str(message)[:199]
     # One row per phone: an OTP for a known number overwrites the
     # previous one instead of appending a second row.
@@ -827,14 +832,23 @@ def api_add_message():
         {
             "phone": phone,
             "message": message,
-            "pub": DEFAULT_MESSAGE_PUB,
+            "pub": message_pub,
             "now": now,
             "revision": revision,
         },
     )
     db.session.commit()
 
-    otp_digits = _extract_normalized_otp(message)
+    # Only normalize OTP for IVAC (word-based OTPs like "ONE_TWO_THREE" or spaced digits "2-5-7-0-0-7").
+    # VFS already sends normalized digit OTPs, so skip normalization for VFS to avoid false matches.
+    if message_pub == "IVAC":
+        otp_digits = _extract_normalized_otp(message)
+    else:
+        # For VFS, just extract digit OTP directly (6 digits)
+        import re
+        m = re.search(r"\b(\d{6})\b", message)
+        otp_digits = m.group(1) if m else ""
+
     if otp_digits:
         otp_broker.publish(
             {
@@ -868,8 +882,16 @@ def api_get_messages(phone):
     if row is None:
         return jsonify({}), 200
 
-    # Only a normalized digit OTP is a real code (drops junk rows).
-    digits = _extract_normalized_otp(row.otp_message)
+    # Use stored message_pub to determine OTP extraction method
+    stored_pub = (row.message_pub or "").strip().upper()
+    if stored_pub == "IVAC":
+        digits = _extract_normalized_otp(row.otp_message)
+    else:
+        # For VFS, just extract digit OTP directly (6 digits)
+        import re
+        m = re.search(r"\b(\d{6})\b", row.otp_message)
+        digits = m.group(1) if m else ""
+
     if not digits:
         return jsonify({}), 200
 
@@ -877,6 +899,7 @@ def api_get_messages(phone):
         {
             "message": digits,
             "last_updated": _format_bdt(row.updated_at),
+            "message_pub": stored_pub,
         }
     ), 200
 
