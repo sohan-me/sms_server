@@ -174,6 +174,20 @@ NUMBER_WORD_TO_DIGIT = {
 }
 
 
+_MASKED_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:\+?88[\s\-_.]*)?"
+    r"(?:"
+        r"\d+(?:[\s\-_.]*[\*xX•]{2,})+(?:[\s\-_.]*\d+)?"
+        r"|[\*•]{2,}(?:[\s\-_.]*\d+)?"
+        r"|[xX]{2,}[\s\-_.]*\d+"
+        r"|\.{3,}[\s\-_.]*\d+"
+        r"|01[3-9](?:[\s\-_.]*[\*xX•]+)+(?:[\s\-_.]*\d+)?"
+    r")"
+    r"(?![A-Za-z0-9])"
+)
+
+
 def _extract_normalized_otp(raw):
     """Turn IVAC word OTPs / spaced digits into a digit string."""
     if raw is None:
@@ -181,6 +195,7 @@ def _extract_normalized_otp(raw):
     text = str(raw).strip()
     if not text:
         return ""
+    text = _MASKED_NUMBER_RE.sub(" ", text)
 
     # 1) Number-word run (4–8 words): Five-Six-Nine-One-Two-Five → 569125
     tokens = re.findall(r"[a-z]+", text.lower())

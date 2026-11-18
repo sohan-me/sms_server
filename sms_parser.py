@@ -58,6 +58,21 @@ _SEPARATED_SPAN_RE = re.compile(
     r"(?<!\d)\d+(?:[" + _SEPARATOR_CHARS + r"]+\d+)+(?![" + _SEPARATOR_CHARS + r"]*\d)"
 )
 _DIGIT_GROUP_SPLIT_RE = re.compile(r"[" + _SEPARATOR_CHARS + r"]+")
+# Masked phone numbers, card numbers, and account numbers (e.g. 019****4492,
+# 017***1234, 017XXXX1234, ****4492, 0171234****, ...4492).
+# These must never be concatenated into codes or read as OTPs.
+_MASKED_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:\+?88[\s\-_.]*)?"
+    r"(?:"
+        r"\d+(?:[\s\-_.]*[\*xX•]{2,})+(?:[\s\-_.]*\d+)?"
+        r"|[\*•]{2,}(?:[\s\-_.]*\d+)?"
+        r"|[xX]{2,}[\s\-_.]*\d+"
+        r"|\.{3,}[\s\-_.]*\d+"
+        r"|01[3-9](?:[\s\-_.]*[\*xX•]+)+(?:[\s\-_.]*\d+)?"
+    r")"
+    r"(?![A-Za-z0-9])"
+)
 # Word boundaries matter: without them an 11-digit phone number would be
 # truncated to 8 digits and read as a code.
 _CONTIGUOUS_RE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
@@ -122,6 +137,16 @@ LABELED_DIRECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+LABELED_REVERSE_RE = re.compile(
+    r"\b([A-Za-z0-9]{4,8})\b[\s:=,\-\./\+\*]+"
+    r"(?:is|are|as)\s+"
+    r"(?:your\s+|the\s+|an?\s+)?"
+    r"(?:[A-Za-z0-9\-]+\s+){0,3}"
+    r"(?:otp|o\.t\.p\.?|verification\s+code|verify\s+code|security\s+code|login\s+code|"
+    r"confirmation\s+code|passcode|password|pin|code|one[\s\-]time\s+password)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class ParsedSms:
@@ -161,6 +186,11 @@ class SmsPatterns:
 def normalize_text(raw) -> str:
     """NFKC + Bengali digits, but keep case: TRX IDs are case-bearing."""
     return unicodedata.normalize("NFKC", str(raw or "")).translate(_BENGALI_DIGITS).strip()
+
+
+def _sanitize_masked_numbers(text: str) -> str:
+    """Replace masked phone/account numbers with spaces, preserving character offsets."""
+    return _MASKED_NUMBER_RE.sub(lambda m: " " * len(m.group(0)), text)
 
 
 def _phrase_pattern(phrase: str) -> "re.Pattern":
@@ -413,7 +443,11 @@ def _separated_span(text: str) -> str:
     """
     best = ""
     for match in _SEPARATED_SPAN_RE.finditer(text):
-        groups = [g for g in _DIGIT_GROUP_SPLIT_RE.split(match.group(0)) if g]
+        raw_span = match.group(0)
+        # Avoid masked phone/account numbers (e.g. 019****4492, ****1234)
+        if re.search(r"[\*xX•]{2,}", raw_span):
+            continue
+        groups = [g for g in _DIGIT_GROUP_SPLIT_RE.split(raw_span) if g]
         if len(groups) < 2:
             continue
         # Avoid dates like 31-12-2026 or 2026-12-31
@@ -423,6 +457,8 @@ def _separated_span(text: str) -> str:
         if len(lengths) > 2 or (len(lengths) == 2 and max(lengths) - min(lengths) > 1):
             continue
         digits = "".join(groups)
+        if digits.startswith("01") and re.search(r"[\*xX•]", raw_span):
+            continue
         if 4 <= len(digits) <= 8 and len(digits) > len(best):
             best = digits
     return best
@@ -494,16 +530,36 @@ def _compound_word_run(lower_text: str) -> str:
 
 
 def _extract_labeled_otp(text: str) -> str:
-    """Extract directly labeled OTP: OTP is Ab76gTf, Code: 123456, etc."""
+    """Extract directly labeled OTP: OTP is Ab76gTf, Code: 123456, or 959196 is your OTP."""
+    candidates: List[Tuple[int, str]] = []
+
     for m in LABELED_DIRECT_RE.finditer(text):
-        candidate = m.group(1)
+        cand = m.group(1)
         for prefix in ("otp", "pin", "code"):
-            if candidate.lower().startswith(prefix):
-                rest = candidate[len(prefix):]
+            if cand.lower().startswith(prefix):
+                rest = cand[len(prefix):]
                 if 4 <= len(rest) <= 8 and rest.lower() not in COMMON_STOP_WORDS:
-                    return rest
-        if candidate.lower() not in COMMON_STOP_WORDS:
-            return candidate
+                    candidates.append((m.start(), rest))
+                    break
+        else:
+            if cand.lower() not in COMMON_STOP_WORDS:
+                candidates.append((m.start(), cand))
+
+    for m in LABELED_REVERSE_RE.finditer(text):
+        cand = m.group(1)
+        for prefix in ("otp", "pin", "code"):
+            if cand.lower().startswith(prefix):
+                rest = cand[len(prefix):]
+                if 4 <= len(rest) <= 8 and rest.lower() not in COMMON_STOP_WORDS:
+                    candidates.append((m.start(), rest))
+                    break
+        else:
+            if cand.lower() not in COMMON_STOP_WORDS:
+                candidates.append((m.start(), cand))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
     return ""
 
 
@@ -624,7 +680,8 @@ def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
     """
     patterns = patterns or get_patterns()
     text = normalize_text(message)
-    lower = text.lower()
+    clean_text = _sanitize_masked_numbers(text)
+    lower = clean_text.lower()
 
     # 1. Worded digits (Zero–Nine) — any separator (- _ space / . , :)
     word_run = _number_word_run(lower)
@@ -634,32 +691,32 @@ def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
     # 2. Separated groups — A 1 g 0 G i 7, A1-g0-Gi7, letters + digits, 4–8 chars
     #    Before the labeled reader on purpose: "code: AB12-CD3" would otherwise
     #    stop at the first group and report "AB12".
-    spaced_alnum = _separated_alnum_run(text)
+    spaced_alnum = _separated_alnum_run(clean_text)
     if spaced_alnum:
         return spaced_alnum
 
     # 3. Labeled — OTP / code / pin / password / passcode / verification code + value
-    labeled = _extract_labeled_otp(text)
+    labeled = _extract_labeled_otp(clean_text)
     if labeled:
         return labeled
 
     # 4. Spaced/hyphen digits — 4–8 digits with spaces/hyphens
-    separated = _separated_span(text)
+    separated = _separated_span(clean_text)
     if separated:
         return separated
 
     # 5. Alphanumeric — letters + digits, 4–8 chars, any case
-    alnum = _extract_alphanumeric_otp(text)
+    alnum = _extract_alphanumeric_otp(clean_text)
     if alnum:
         return alnum
 
     # 6. Numeric — plain 4–8 digits
     anchor = _otp_anchor(lower, patterns)
     if anchor:
-        block = _contiguous_block(text, start=anchor[1])
+        block = _contiguous_block(clean_text, start=anchor[1])
         if block:
             return block
-    numeric = _contiguous_block(text)
+    numeric = _contiguous_block(clean_text)
     if numeric:
         return numeric
 
@@ -669,7 +726,7 @@ def extract_otp_code(message, patterns: Optional[SmsPatterns] = None) -> str:
         return compound
 
     # 8. Alphabet-only — letters only, 4–8 chars, any case
-    alpha = _extract_alphabet_only_otp(text)
+    alpha = _extract_alphabet_only_otp(clean_text)
     if alpha:
         return alpha
 
@@ -782,7 +839,8 @@ def parse_sms(
     """
     patterns = patterns or get_patterns()
     text = normalize_text(message)
-    lower = text.lower()
+    clean_text = _sanitize_masked_numbers(text)
+    lower = clean_text.lower()
     raw_sender = str(sender or "").strip()
 
     otp_keyword = _otp_anchor(lower, patterns)
@@ -800,7 +858,7 @@ def parse_sms(
     else:
         family, sender_label = "", raw_sender
 
-    otp = extract_otp_code(text, patterns)
+    otp = extract_otp_code(clean_text, patterns)
     trx = extract_trx_id(text, patterns)
     amount = extract_amount(text)
 
@@ -851,13 +909,13 @@ def parse_sms(
             and (
                 otp_keyword
                 or _number_word_run(lower)
-                or _extract_labeled_otp(text)
-                or _separated_alnum_run(text)
-                or _separated_span(text)
-                or _extract_alphanumeric_otp(text)
+                or _extract_labeled_otp(clean_text)
+                or _separated_alnum_run(clean_text)
+                or _separated_span(clean_text)
+                or _extract_alphanumeric_otp(clean_text)
                 or _compound_word_run(lower)
-                or _extract_alphabet_only_otp(text)
-                or re.fullmatch(r"[A-Za-z0-9]{4,8}", text.strip())
+                or _extract_alphabet_only_otp(clean_text)
+                or re.fullmatch(r"[A-Za-z0-9]{4,8}", clean_text.strip())
                 or family == KIND_SIGNIN
                 or signin_keyword
             )

@@ -65,6 +65,20 @@ def normalize_bd_phone(value):
     return d
 
 
+_MASKED_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:\+?88[\s\-_.]*)?"
+    r"(?:"
+        r"\d+(?:[\s\-_.]*[\*xX•]{2,})+(?:[\s\-_.]*\d+)?"
+        r"|[\*•]{2,}(?:[\s\-_.]*\d+)?"
+        r"|[xX]{2,}[\s\-_.]*\d+"
+        r"|\.{3,}[\s\-_.]*\d+"
+        r"|01[3-9](?:[\s\-_.]*[\*xX•]+)+(?:[\s\-_.]*\d+)?"
+    r")"
+    r"(?![A-Za-z0-9])"
+)
+
+
 def extract_normalized_otp(raw):
     """Turn IVAC word OTPs / spaced digits into a digit string."""
     if raw is None:
@@ -72,6 +86,7 @@ def extract_normalized_otp(raw):
     text = str(raw).strip()
     if not text:
         return ""
+    text = _MASKED_NUMBER_RE.sub(" ", text)
 
     tokens = re.findall(r"[a-z]+", text.lower())
     best = []

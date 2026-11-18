@@ -857,6 +857,92 @@ class AllOtpFormatsTests(unittest.TestCase):
                 self.assertEqual(parsed.kind, expected_kind)
                 self.assertEqual(parsed.otp, expected)
 
+    def test_masked_phone_numbers_are_not_extracted_as_otp(self):
+        # Masked numbers with asterisks, x, bullets, or leading dots must not be read as codes
+        self.assertEqual(
+            extract_otp_code("Rocket no# 019****4492 which is valid", PATTERNS),
+            "",
+        )
+        self.assertEqual(
+            extract_otp_code("Payment of Tk 500 to Rocket no# 019****4492 successful.", PATTERNS),
+            "",
+        )
+        self.assertEqual(
+            extract_otp_code("Ref 017***1234 sent", PATTERNS),
+            "",
+        )
+        self.assertEqual(
+            extract_otp_code("Account 017XXXX1234", PATTERNS),
+            "",
+        )
+        self.assertEqual(
+            extract_otp_code("Account 017••••1234", PATTERNS),
+            "",
+        )
+        self.assertEqual(
+            extract_otp_code("Your OTP is 959196 for account 019****4492", PATTERNS),
+            "959196",
+        )
+        self.assertEqual(
+            extract_otp_code("Your OTP is 959196 for account 0171234****", PATTERNS),
+            "959196",
+        )
+        self.assertEqual(
+            extract_otp_code("Your OTP is 959196 for card ****1234", PATTERNS),
+            "959196",
+        )
+        self.assertEqual(
+            extract_otp_code("Your OTP is 959196 for A/C ...4492", PATTERNS),
+            "959196",
+        )
+
+    def test_reverse_labeled_otp(self):
+        cases = [
+            ("959196 is your OTP", "959196"),
+            ("959196 is the OTP", "959196"),
+            ("959196 is your verification code", "959196"),
+            ("959196 is your login code", "959196"),
+            ("959196 is your e-com OTP", "959196"),
+            ("959196 is your Rocket OTP", "959196"),
+            ("Use 959196 as your OTP", "959196"),
+            ("959196 is your one-time password", "959196"),
+        ]
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(extract_otp_code(body, PATTERNS), expected)
+
+    def test_rocket_payment_otp_with_masked_number(self):
+        # Rocket messages containing masked numbers (e.g. 019****4492, 017****1234)
+        messages = [
+            "Rocket\nOTP\n959196 is your OTP for e-com transaction of Rocket no# 019****4492 which is valid for 2 minutes.",
+            "959196 is your OTP for e-com transaction of Rocket no# 019****4492 which is valid for 2 minutes.",
+            "959196 is your OTP for e-com transaction of Rocket no# 017****1234 which is valid for 2 minutes.",
+            "Rocket: 959196 is your OTP for e-com transaction of Rocket no# 017****1234 which is valid for 2 minutes.",
+            "Rocket\nOTP\n959196 is your OTP for e-com transaction of Rocket no# 017****1234 which is valid for 2 minutes.",
+        ]
+        for msg in messages:
+            with self.subTest(msg=msg):
+                parsed = parse_sms(msg, sender="Rocket", patterns=PATTERNS)
+                self.assertEqual(parsed.kind, KIND_PAYMENT)
+                self.assertEqual(parsed.otp, "959196")
+                self.assertEqual(parsed.code, "959196")
+                self.assertEqual(parsed.sender, "Rocket")
+
+    def test_other_mfs_payment_otp_with_masked_number(self):
+        nagad_msg = "Nagad: 654321 is your OTP for purchase at daraz of account 018****5678"
+        parsed_nagad = parse_sms(nagad_msg, sender="Nagad", patterns=PATTERNS)
+        self.assertEqual(parsed_nagad.kind, KIND_PAYMENT)
+        self.assertEqual(parsed_nagad.otp, "654321")
+        self.assertEqual(parsed_nagad.code, "654321")
+        self.assertEqual(parsed_nagad.sender, "Nagad")
+
+        bkash_msg = "bKash: 123456 is your OTP for payment to daraz of wallet 017****1234"
+        parsed_bkash = parse_sms(bkash_msg, sender="bKash", patterns=PATTERNS)
+        self.assertEqual(parsed_bkash.kind, KIND_PAYMENT)
+        self.assertEqual(parsed_bkash.otp, "123456")
+        self.assertEqual(parsed_bkash.code, "123456")
+        self.assertEqual(parsed_bkash.sender, "bKash")
+
 
 if __name__ == "__main__":
     unittest.main()
