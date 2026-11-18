@@ -886,8 +886,26 @@ def api_get_messages(phone):
     if row is None:
         return jsonify({}), 200
 
-    # Use stored message_pub to determine OTP extraction method
+    # Freshness cursor. A caller that passes the `revision` it saw on a previous
+    # poll is telling us "only give me an OTP that arrived after this one". The
+    # row is reused per phone, so its id never moves and last_updated alone
+    # cannot distinguish a genuinely new SMS from a stale row still inside the
+    # retention window. Without this a bot resuming after a pause immediately
+    # consumes an OTP that was already used minutes ago.
+    try:
+        since_revision = int(request.args.get("revision", ""))
+    except (TypeError, ValueError):
+        since_revision = None
+    if since_revision is not None and int(row.revision or 0) <= since_revision:
+        return jsonify({}), 200
+
+    # Optional publisher filter. Omitted keeps the historical "latest row"
+    # behaviour so existing clients are unaffected.
+    wanted_pub = (request.args.get("message_pub") or "").strip().upper()
     stored_pub = (row.message_pub or "").strip().upper()
+    if wanted_pub in ("VFS", "IVAC") and stored_pub != wanted_pub:
+        return jsonify({}), 200
+
     if stored_pub == "IVAC":
         digits = _extract_normalized_otp(row.otp_message)
     else:
@@ -904,6 +922,9 @@ def api_get_messages(phone):
             "message": digits,
             "last_updated": _format_bdt(row.updated_at),
             "message_pub": stored_pub,
+            # Monotonic arrival counter. Callers should pass this back as
+            # ?revision= on their next poll to avoid re-reading a used OTP.
+            "revision": int(row.revision or 0),
         }
     ), 200
 

@@ -241,7 +241,9 @@ class OTPServerTests(unittest.TestCase):
 
         # One row per number: the body is a single object, not a list.
         self.assertIsInstance(payload, dict)
-        self.assertEqual(sorted(payload), ["last_updated", "message", "message_pub"])
+        self.assertEqual(
+            sorted(payload), ["last_updated", "message", "message_pub", "revision"]
+        )
         self.assertEqual(payload["message"], "111111")
         self.assertIn(payload["message_pub"], ("VFS", "IVAC"))
         self.assertTrue(payload["last_updated"].endswith("+06:00"))
@@ -283,6 +285,62 @@ class OTPServerTests(unittest.TestCase):
         payload = client.get("/api/messages/01712345681").get_json()
         self.assertEqual(payload["message_pub"], "VFS")
         self.assertEqual(payload["message"], "445566")
+
+    def test_get_exposes_a_monotonic_revision(self):
+        client = app.test_client()
+        client.post(
+            "/api/messages",
+            json={"phone": "01712345690", "message": "code 111111"},
+        )
+        first = client.get("/api/messages/01712345690").get_json()
+        self.assertIn("revision", first)
+        rev1 = first["revision"]
+
+        client.post(
+            "/api/messages",
+            json={"phone": "01712345690", "message": "code 222222"},
+        )
+        second = client.get("/api/messages/01712345690").get_json()
+        self.assertGreater(second["revision"], rev1)
+        self.assertEqual(second["message"], "222222")
+
+    def test_revision_query_hides_an_already_seen_otp(self):
+        client = app.test_client()
+        client.post(
+            "/api/messages",
+            json={"phone": "01712345691", "message": "code 333333"},
+        )
+        seen = client.get("/api/messages/01712345691").get_json()
+        rev = seen["revision"]
+
+        # Polling with the revision the caller already consumed returns nothing.
+        again = client.get(f"/api/messages/01712345691?revision={rev}").get_json()
+        self.assertEqual(again, {})
+
+        # A newer arrival is visible past that cursor.
+        client.post(
+            "/api/messages",
+            json={"phone": "01712345691", "message": "code 444444"},
+        )
+        newer = client.get(f"/api/messages/01712345691?revision={rev}").get_json()
+        self.assertEqual(newer["message"], "444444")
+
+    def test_message_pub_query_filters_when_given(self):
+        client = app.test_client()
+        client.post(
+            "/api/messages",
+            json={
+                "phone": "01712345692",
+                "message": "Your IVAC OTP is 5-5-5-1-1-1",
+                "message_pub": "IVAC",
+            },
+        )
+        # Asking for the publisher that is stored returns it.
+        match = client.get("/api/messages/01712345692?message_pub=IVAC").get_json()
+        self.assertEqual(match["message_pub"], "IVAC")
+        # Asking for the other publisher returns nothing rather than the wrong code.
+        mismatch = client.get("/api/messages/01712345692?message_pub=VFS").get_json()
+        self.assertEqual(mismatch, {})
 
     def test_camel_case_message_pub_still_accepted_for_backward_compat(self):
         client = app.test_client()
