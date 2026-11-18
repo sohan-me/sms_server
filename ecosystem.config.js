@@ -1,5 +1,5 @@
 // pm2 start ecosystem.config.js
-// pm2 logs orbitalcore-sms
+// pm2 logs raven-sms
 //
 // env here is what reaches the gunicorn workers — a .env file does not.
 // Do not start app.py directly: its __main__ runs the Werkzeug dev server with
@@ -8,7 +8,7 @@
 module.exports = {
   apps: [
     {
-      name: "orbitalcore-sms",
+      name: "raven-sms",
       // Via the interpreter: a copied venv keeps absolute-path shebangs in bin/,
       // so venv/bin/gunicorn can point at a machine that no longer exists.
       script: "venv/bin/python",

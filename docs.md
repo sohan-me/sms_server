@@ -166,7 +166,7 @@ the query entirely.
 
 ```bash
 pm2 start ecosystem.config.js
-pm2 logs orbitalcore-sms
+pm2 logs raven-sms
 ```
 
 `ecosystem.config.js` launches gunicorn through `venv/bin/python -m gunicorn` rather

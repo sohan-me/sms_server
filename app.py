@@ -40,7 +40,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "sqlite:///" + os.path.join(BASE_DIR, "device_auth.db"),
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "orbitalcore-default-secret")
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "raven-default-secret")
 app.config["WS_AUTH_TOKEN"] = os.environ.get("WS_AUTH_TOKEN", "").strip() or None
 
 db.init_app(app)
@@ -806,8 +806,12 @@ def api_add_message():
     if not phone or not message:
         return jsonify({"error": "Missing phone or message"}), 400
 
-    # Read message_pub from request (VFS or IVAC), default to IVAC for backward compat
-    message_pub = (data.get("message_pub") or data.get("messagePub") or "").strip().upper()
+    # Publisher: canonical snake_case `message_pub` wins; `messagePub` is accepted
+    # only for backward compatibility. Clients should send exactly one.
+    raw_pub = data.get("message_pub")
+    if raw_pub is None or not str(raw_pub).strip():
+        raw_pub = data.get("messagePub")
+    message_pub = str(raw_pub or "").strip().upper()
     if message_pub not in ("VFS", "IVAC"):
         message_pub = DEFAULT_MESSAGE_PUB
 

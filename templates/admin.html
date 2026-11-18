@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Devices · OrbitalCore{% endblock %}
+{% block title %}Devices · Raven{% endblock %}
 
 {% block head %}
 <style>
@@ -72,7 +72,7 @@
   <header class="topbar">
     <a class="brand" href="{{ url_for('admin_dashboard') }}">
       <span class="brand-mark" aria-hidden="true"></span>
-      Orbital<span class="accent">Core</span>
+      Raven<span class="accent">SMS</span>
     </a>
     <div class="topbar-meta">
       <span>{{ session.get('username', 'admin') }}</span>
@@ -140,7 +140,7 @@
 
   <div class="panel" style="padding:1rem 1rem 0.5rem;">
     <div class="table-scroll">
-      <table class="oc-table">
+      <table class="rv-table">
         <thead>
           <tr>
             <th>ID</th>

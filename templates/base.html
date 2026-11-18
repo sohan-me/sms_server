@@ -3,27 +3,27 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}OrbitalCore{% endblock %}</title>
+  <title>{% block title %}Raven{% endblock %}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-0: #070b12;
-      --bg-1: #0d1522;
-      --bg-2: #141e2e;
-      --panel: rgba(18, 28, 44, 0.82);
-      --border: rgba(120, 170, 220, 0.14);
-      --text: #e8eef7;
-      --muted: #8b9bb3;
-      --cyan: #3dd6c6;
-      --cyan-dim: rgba(61, 214, 198, 0.15);
-      --amber: #e8a838;
-      --amber-dim: rgba(232, 168, 56, 0.14);
+      --bg-0: #0a0c0a;
+      --bg-1: #11150f;
+      --bg-2: #171d15;
+      --panel: rgba(20, 27, 18, 0.84);
+      --border: rgba(163, 230, 53, 0.14);
+      --text: #eef4e7;
+      --muted: #93a389;
+      --cyan: #b4f461;
+      --cyan-dim: rgba(180, 244, 97, 0.14);
+      --amber: #e8c838;
+      --amber-dim: rgba(232, 200, 56, 0.14);
       --danger: #ff6b7a;
       --danger-dim: rgba(255, 107, 122, 0.12);
-      --ok: #4ade80;
-      --ok-dim: rgba(74, 222, 128, 0.12);
+      --ok: #a3e635;
+      --ok-dim: rgba(163, 230, 53, 0.12);
       --radius: 14px;
       --font-display: "Syne", system-ui, sans-serif;
       --font-body: "DM Sans", system-ui, sans-serif;
@@ -37,9 +37,9 @@
       font-family: var(--font-body);
       color: var(--text);
       background:
-        radial-gradient(1200px 600px at 10% -10%, rgba(61, 214, 198, 0.12), transparent 55%),
-        radial-gradient(900px 500px at 100% 0%, rgba(232, 168, 56, 0.08), transparent 50%),
-        linear-gradient(165deg, var(--bg-0), var(--bg-1) 45%, #0a101a);
+        radial-gradient(1200px 600px at 10% -10%, rgba(180, 244, 97, 0.13), transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, rgba(163, 230, 53, 0.07), transparent 50%),
+        linear-gradient(165deg, var(--bg-0), var(--bg-1) 45%, #0c100a);
       background-attachment: fixed;
     }
 
@@ -84,15 +84,15 @@
       height: 36px;
       border-radius: 10px;
       background:
-        linear-gradient(135deg, var(--cyan), #1a8f9e 55%, var(--amber));
-      box-shadow: 0 0 24px rgba(61, 214, 198, 0.35);
+        linear-gradient(135deg, var(--cyan), #7bb32e 55%, #4d7718);
+      box-shadow: 0 0 24px rgba(180, 244, 97, 0.35);
       position: relative;
     }
     .brand-mark::after {
       content: "";
       position: absolute;
       inset: 9px;
-      border: 2px solid rgba(7, 11, 18, 0.55);
+      border: 2px solid rgba(10, 12, 10, 0.6);
       border-radius: 50%;
       border-top-color: transparent;
       transform: rotate(-25deg);
@@ -124,14 +124,14 @@
       cursor: pointer;
       transition: border-color 0.2s, background 0.2s, transform 0.15s;
     }
-    .btn:hover { border-color: rgba(61, 214, 198, 0.45); background: #1a2740; }
+    .btn:hover { border-color: rgba(180, 244, 97, 0.45); background: #202a1b; }
     .btn:active { transform: scale(0.98); }
     .btn-primary {
-      background: linear-gradient(135deg, #2bb8aa, #1d8f9a);
+      background: linear-gradient(135deg, #b4f461, #7bb32e);
       border-color: transparent;
-      color: #041018;
+      color: #0a1405;
     }
-    .btn-primary:hover { filter: brightness(1.06); background: linear-gradient(135deg, #2bb8aa, #1d8f9a); }
+    .btn-primary:hover { filter: brightness(1.06); background: linear-gradient(135deg, #b4f461, #7bb32e); }
     .btn-ghost { background: transparent; }
     .btn-danger { color: var(--danger); border-color: rgba(255, 107, 122, 0.35); }
     .btn-danger:hover { background: var(--danger-dim); }
@@ -158,7 +158,7 @@
       font-size: 0.9rem;
       border: 1px solid var(--border);
     }
-    .flash.success { background: var(--ok-dim); color: var(--ok); border-color: rgba(74, 222, 128, 0.25); }
+    .flash.success { background: var(--ok-dim); color: var(--ok); border-color: rgba(163, 230, 53, 0.25); }
     .flash.danger { background: var(--danger-dim); color: var(--danger); border-color: rgba(255, 107, 122, 0.3); }
     .flash.warning { background: var(--amber-dim); color: var(--amber); border-color: rgba(232, 168, 56, 0.3); }
 
@@ -174,7 +174,7 @@
     }
     .form-control:focus {
       outline: none;
-      border-color: rgba(61, 214, 198, 0.55);
+      border-color: rgba(180, 244, 97, 0.55);
       box-shadow: 0 0 0 3px var(--cyan-dim);
     }
     label {
@@ -196,24 +196,24 @@
       font-weight: 600;
       letter-spacing: 0.02em;
     }
-    .badge-active { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(61, 214, 198, 0.3); }
+    .badge-active { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(180, 244, 97, 0.3); }
     .badge-pending { background: rgba(139, 155, 179, 0.12); color: var(--muted); border: 1px solid var(--border); }
     .badge-expired { background: var(--danger-dim); color: var(--danger); border: 1px solid rgba(255, 107, 122, 0.3); }
 
     code.token {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.72rem;
-      color: #9ad4ff;
+      color: #c8f58f;
       word-break: break-all;
       user-select: all;
     }
 
-    table.oc-table {
+    table.rv-table {
       width: 100%;
       border-collapse: separate;
       border-spacing: 0 10px;
     }
-    table.oc-table th {
+    table.rv-table th {
       text-align: left;
       font-size: 0.7rem;
       text-transform: uppercase;
@@ -222,17 +222,17 @@
       font-weight: 600;
       padding: 0 1rem 0.5rem;
     }
-    table.oc-table td {
+    table.rv-table td {
       background: rgba(255, 255, 255, 0.03);
       padding: 1rem;
       vertical-align: middle;
       transition: background 0.2s, transform 0.2s;
     }
-    table.oc-table tr:hover td {
+    table.rv-table tr:hover td {
       background: rgba(255, 255, 255, 0.055);
     }
-    table.oc-table tr td:first-child { border-radius: 12px 0 0 12px; }
-    table.oc-table tr td:last-child { border-radius: 0 12px 12px 0; }
+    table.rv-table tr td:first-child { border-radius: 12px 0 0 12px; }
+    table.rv-table tr td:last-child { border-radius: 0 12px 12px 0; }
 
     .sig-line { font-size: 0.8rem; margin-bottom: 0.2rem; color: var(--muted); }
     .sig-line strong { color: var(--cyan); font-weight: 600; margin-right: 0.25rem; }
@@ -245,7 +245,7 @@
 
     @media (max-width: 900px) {
       .table-scroll { overflow-x: auto; }
-      table.oc-table { min-width: 920px; }
+      table.rv-table { min-width: 920px; }
     }
   </style>
   {% block head %}{% endblock %}

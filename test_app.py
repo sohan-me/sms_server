@@ -241,8 +241,9 @@ class OTPServerTests(unittest.TestCase):
 
         # One row per number: the body is a single object, not a list.
         self.assertIsInstance(payload, dict)
-        self.assertEqual(sorted(payload), ["last_updated", "message"])
+        self.assertEqual(sorted(payload), ["last_updated", "message", "message_pub"])
         self.assertEqual(payload["message"], "111111")
+        self.assertIn(payload["message_pub"], ("VFS", "IVAC"))
         self.assertTrue(payload["last_updated"].endswith("+06:00"))
 
     def test_ingesting_a_newer_otp_overwrites_the_number_s_row(self):
@@ -264,6 +265,41 @@ class OTPServerTests(unittest.TestCase):
 
         payload = client.get("/api/messages/01712345679").get_json()
         self.assertEqual(payload["message"], "222222")
+
+    def test_snake_case_message_pub_wins_over_camel_case(self):
+        client = app.test_client()
+
+        response = client.post(
+            "/api/messages",
+            json={
+                "phone": "01712345681",
+                "message": "Your code is 445566",
+                "message_pub": "VFS",
+                "messagePub": "IVAC",
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+
+        payload = client.get("/api/messages/01712345681").get_json()
+        self.assertEqual(payload["message_pub"], "VFS")
+        self.assertEqual(payload["message"], "445566")
+
+    def test_camel_case_message_pub_still_accepted_for_backward_compat(self):
+        client = app.test_client()
+
+        response = client.post(
+            "/api/messages",
+            json={
+                "phone": "01712345682",
+                "message": "Your code is 778899",
+                "messagePub": "IVAC",
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+
+        payload = client.get("/api/messages/01712345682").get_json()
+        self.assertEqual(payload["message_pub"], "IVAC")
+        self.assertEqual(payload["message"], "778899")
 
     def test_http_returns_only_the_latest_otp_for_a_number(self):
         now = datetime.now(timezone.utc).replace(tzinfo=None)

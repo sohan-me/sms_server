@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Sign in · OrbitalCore{% endblock %}
+{% block title %}Sign in · Raven{% endblock %}
 
 {% block head %}
 <style>
@@ -16,8 +16,8 @@
     position: absolute;
     inset: 0;
     background:
-      radial-gradient(ellipse 80% 50% at 50% 0%, rgba(61, 214, 198, 0.18), transparent 60%),
-      linear-gradient(180deg, transparent 40%, rgba(7, 11, 18, 0.9));
+      radial-gradient(ellipse 80% 50% at 50% 0%, rgba(180, 244, 97, 0.18), transparent 60%),
+      linear-gradient(180deg, transparent 40%, rgba(10, 12, 10, 0.9));
     pointer-events: none;
     animation: pulseGlow 8s ease-in-out infinite alternate;
   }
@@ -66,7 +66,7 @@
     <div class="login-brand">
       <a class="brand" href="{{ url_for('admin_login') }}">
         <span class="brand-mark" aria-hidden="true"></span>
-        Orbital<span class="accent">Core</span>
+        Raven<span class="accent">SMS</span>
       </a>
       <p>Admin console for device access &amp; WSS tokens</p>
     </div>

@@ -11,6 +11,8 @@ except ImportError:  # pragma: no cover
     redis = None
 
 
+from otp_core import OTP_CHANNEL
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,7 +24,7 @@ class OTPBroker:
     the database poller as the sole cross-worker delivery path.
     """
 
-    def __init__(self, redis_url, on_message, channel="orbitalcore:otp"):
+    def __init__(self, redis_url, on_message, channel=OTP_CHANNEL):
         self.redis_url = (redis_url or "").strip()
         self.on_message = on_message
         self.channel = channel

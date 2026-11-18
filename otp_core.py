@@ -26,7 +26,7 @@ NUMBER_WORD_TO_DIGIT = {
     "nine": "9",
 }
 
-OTP_CHANNEL = "orbitalcore:otp"
+OTP_CHANNEL = "raven:otp"
 
 
 def norm_sig(value):
