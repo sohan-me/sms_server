@@ -342,6 +342,34 @@ class OTPServerTests(unittest.TestCase):
         mismatch = client.get("/api/messages/01712345692?message_pub=VFS").get_json()
         self.assertEqual(mismatch, {})
 
+    def test_list_messages_discloses_recent_otp_phones(self):
+        """The fan-out list endpoint must expose which phones hold a fresh row,
+        so a bot can discover the number the OTP actually landed on."""
+        client = app.test_client()
+        client.post(
+            "/api/messages",
+            json={"phone": "01712345693", "message": "code 555666", "message_pub": "VFS"},
+        )
+        client.post(
+            "/api/messages",
+            json={"phone": "01712345694", "message": "code 777888", "message_pub": "IVAC"},
+        )
+
+        all_rows = client.get("/api/messages").get_json()["messages"]
+        phones = {r["phone"] for r in all_rows}
+        self.assertIn("01712345693", phones)
+        self.assertIn("01712345694", phones)
+        # Each entry carries the fields the fan-out needs.
+        for r in all_rows:
+            if r["phone"] == "01712345693":
+                self.assertEqual(r["message_pub"], "VFS")
+                self.assertIn("revision", r)
+                self.assertIn("last_updated", r)
+
+        # Publisher filter narrows the list to just VFS rows.
+        vfs = client.get("/api/messages?message_pub=VFS").get_json()["messages"]
+        self.assertEqual({r["phone"] for r in vfs}, {"01712345693"})
+
     def test_camel_case_message_pub_still_accepted_for_backward_compat(self):
         client = app.test_client()
 

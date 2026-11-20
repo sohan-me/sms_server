@@ -865,6 +865,41 @@ def api_add_message():
     return jsonify({"success": True, "message": "Message saved successfully"}), 201
 
 
+@app.route("/api/messages", methods=["GET"])
+@app.route("/api/messages/", methods=["GET"])
+def api_list_messages():
+    """List recent OTP rows so a bot can discover which phone actually received
+    the SMS (the forwarder keys a row by the SIM that got it, which can differ
+    from the phone the bot was told to poll). Used to fan out the wait.
+
+    Returns {messages: [{phone, revision, last_updated, message_pub}]}. Optional
+    ?message_pub=VFS|IVAC filters by publisher. Rows past the retention window
+    are pruned first (same as the per-phone GET).
+    """
+    retention = _otp_retention_minutes()
+    expiry_threshold = datetime.utcnow() - timedelta(minutes=retention)
+    OTPMessage.query.filter(OTPMessage.updated_at < expiry_threshold).delete()
+    db.session.commit()
+
+    q = OTPMessage.query.filter(OTPMessage.updated_at >= expiry_threshold)
+    wanted_pub = (request.args.get("message_pub") or "").strip().upper()
+    if wanted_pub in ("VFS", "IVAC"):
+        q = q.filter(OTPMessage.message_pub == wanted_pub)
+    rows = q.order_by(OTPMessage.updated_at.desc()).limit(200).all()
+
+    return jsonify({
+        "messages": [
+            {
+                "phone": str(row.phone or ""),
+                "message_pub": str(row.message_pub or "").upper(),
+                "revision": int(row.revision or 0),
+                "last_updated": _format_bdt(row.updated_at),
+            }
+            for row in rows
+        ],
+    }), 200
+
+
 @app.route("/api/messages/<phone>", methods=["GET"], strict_slashes=False)
 def api_get_messages(phone):
     retention = _otp_retention_minutes()
