@@ -15,13 +15,14 @@ os.environ["DISABLE_DB_OTP_POLLER"] = "1"
 from app import (  # noqa: E402
     _broadcast_otp,
     _drop_user_ws,
+    _extract_otp_for_pub,
     _format_bdt,
     _parse_subscription,
     _serve_ws_connection,
     _unregister_ws,
     app,
 )
-from models import DeviceUser, OTPMessage, db  # noqa: E402
+from models import DevicePing, DeviceUser, OTPMessage, db  # noqa: E402
 
 
 class FakeSocket:
@@ -530,6 +531,187 @@ class OTPServerTests(unittest.TestCase):
                 "db-poller" if payload["db_poller_alive"] else "local-only",
             )
 
+    def test_device_ping_endpoint_creates_and_updates_record(self):
+        with app.test_client() as client:
+            resp = client.post(
+                "/api/ping",
+                json={
+                    "phone": "01712345678",
+                    "slot": 0,
+                    "interval_minutes": 15,
+                    "status": "online",
+                },
+            )
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertTrue(data.get("success"))
+            self.assertEqual(data["ping"]["phone"], "01712345678")
+            self.assertEqual(data["ping"]["slot"], 0)
+            self.assertEqual(data["ping"]["interval_minutes"], 15)
+            self.assertEqual(data["ping"]["status"], "online")
+
+            # Update ping with new interval or status
+            resp2 = client.post(
+                "/api/ping",
+                json={
+                    "phone": "01712345678",
+                    "slot": 0,
+                    "interval_minutes": 30,
+                    "status": "online",
+                },
+            )
+            self.assertEqual(resp2.status_code, 200)
+            data2 = resp2.get_json()
+            self.assertEqual(data2["ping"]["interval_minutes"], 30)
+
+            # Query list
+            list_resp = client.get("/api/ping")
+            self.assertEqual(list_resp.status_code, 200)
+            pings = list_resp.get_json().get("pings")
+            self.assertTrue(any(p["phone"] == "01712345678" for p in pings))
+
+            # Query single
+            get_resp = client.get("/api/ping/01712345678")
+            self.assertEqual(get_resp.status_code, 200)
+            self.assertEqual(get_resp.get_json()["ping"]["phone"], "01712345678")
+
+    def test_ping_via_api_messages_does_not_corrupt_otp_message(self):
+        with app.test_client() as client:
+            # 1. Post a legitimate OTP
+            otp_resp = client.post(
+                "/api/messages",
+                json={
+                    "phone": "01811223344",
+                    "message": "Your VFS code is 654321",
+                    "message_pub": "VFS",
+                },
+            )
+            self.assertEqual(otp_resp.status_code, 201)
+
+            # Verify OTP is stored
+            chk = client.get("/api/messages/01811223344?message_pub=VFS")
+            self.assertEqual(chk.status_code, 200)
+            self.assertEqual(chk.get_json().get("message"), "654321")
+
+            # 2. Forwarder app sends a PING to /api/messages
+            ping_resp = client.post(
+                "/api/messages",
+                json={
+                    "phone": "01811223344",
+                    "message": "PING | phone=01811223344 | SIM 1 | every=15m | status=online",
+                    "message_pub": "PING",
+                },
+            )
+            self.assertEqual(ping_resp.status_code, 200)
+
+            # 3. Verify OTP was NOT overwritten!
+            chk2 = client.get("/api/messages/01811223344?message_pub=VFS")
+            self.assertEqual(chk2.status_code, 200)
+            self.assertEqual(chk2.get_json().get("message"), "654321")
+
+            # 4. Verify the ping was recorded in DevicePing
+            ping_record = client.get("/api/ping/01811223344")
+            self.assertEqual(ping_record.status_code, 200)
+            self.assertEqual(ping_record.get_json()["ping"]["phone"], "01811223344")
+
+    def test_root_console_renders_html_for_browsers(self):
+        with app.test_client() as client:
+            resp = client.get("/", headers={"Accept": "text/html", "User-Agent": "Mozilla/5.0 Chrome/120.0"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("SMS SERVER // CLI CONSOLE", resp.get_data(as_text=True))
+            self.assertIn("sms-cli&gt;", resp.get_data(as_text=True))
+
+    def test_root_console_returns_plain_text_for_curl(self):
+        with app.test_client() as client:
+            resp = client.get("/", headers={"User-Agent": "curl/8.5.0"})
+            self.assertEqual(resp.status_code, 200)
+            text = resp.get_data(as_text=True)
+            self.assertIn("=== SMS Server CLI Console ===", text)
+            self.assertIn("Endpoints:", text)
+            self.assertIn("python cli.py", text)
+
+    def test_root_console_returns_json_endpoints(self):
+        with app.test_client() as client:
+            resp = client.get("/", headers={"Accept": "application/json"})
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertEqual(data.get("service"), "sms_server")
+            self.assertIn("endpoints", data)
+            self.assertIn("pings", data["endpoints"])
+
+    def test_direct_phone_url_retrieves_otp(self):
+        with app.test_client() as client:
+            client.post(
+                "/api/messages",
+                json={
+                    "phone": "01799887766",
+                    "message": "Your IVAC OTP is 987654",
+                    "message_pub": "IVAC",
+                },
+            )
+            # 1. Direct phone lookup via JSON
+            json_resp = client.get("/01799887766", headers={"Accept": "application/json"})
+            self.assertEqual(json_resp.status_code, 200)
+            self.assertEqual(json_resp.get_json().get("message"), "987654")
+
+            # 2. Direct phone lookup via curl (plain text digits)
+            curl_resp = client.get("/01799887766", headers={"User-Agent": "curl/7.88.1"})
+            self.assertEqual(curl_resp.status_code, 200)
+            self.assertEqual(curl_resp.get_data(as_text=True).strip(), "987654")
+
+            # 3. Invalid phone returns 404
+            err_resp = client.get("/not-a-phone")
+            self.assertEqual(err_resp.status_code, 404)
+
+    def test_pub_query_parameter_filter_supports_both_pub_and_message_pub(self):
+        with app.test_client() as client:
+            client.post(
+                "/api/messages",
+                json={
+                    "phone": "01755443322",
+                    "message": "Your VFS registration code is 334455",
+                    "message_pub": "VFS",
+                },
+            )
+            # Test ?pub=vfs
+            r1 = client.get("/api/messages/01755443322?pub=vfs")
+            self.assertEqual(r1.status_code, 200)
+            self.assertEqual(r1.get_json()["message"], "334455")
+            self.assertEqual(r1.get_json()["message_pub"], "VFS")
+
+            # Test ?pub=VFS
+            r2 = client.get("/api/messages/01755443322?pub=VFS")
+            self.assertEqual(r2.status_code, 200)
+            self.assertEqual(r2.get_json()["message"], "334455")
+
+            # Test mismatch filter: ?pub=ivac should return empty dict
+            r3 = client.get("/api/messages/01755443322?pub=ivac")
+            self.assertEqual(r3.status_code, 200)
+            self.assertEqual(r3.get_json(), {})
+
+            # Test /api/messages list with ?pub=vfs
+            r4 = client.get("/api/messages?pub=vfs")
+            self.assertEqual(r4.status_code, 200)
+            messages = r4.get_json()["messages"]
+            self.assertTrue(any(m["phone"] == "01755443322" for m in messages))
+
+    def test_extract_otp_for_pub_handles_vfs_and_ivac_distinctly(self):
+        # VFS must only match standalone 6-digit OTPs, never phone numbers in test strings
+        self.assertEqual(
+            _extract_otp_for_pub("Test from VFS SMS Relay app (SIM 1 / slot 0, phone=01712345678)", "VFS"),
+            "",
+        )
+        self.assertEqual(
+            _extract_otp_for_pub("881521 is the OTP for Login to your VFS Global application.", "VFS"),
+            "881521",
+        )
+        # IVAC supports word-based OTPs
+        self.assertEqual(
+            _extract_otp_for_pub("Your OTP is Five-Six-Nine-One-Two-Five", "IVAC"),
+            "569125",
+        )
+
+
 
 class RedisIsOptionalTests(unittest.TestCase):
     """Redis is an accelerator, never a requirement.
@@ -635,6 +817,7 @@ class RedisIsOptionalTests(unittest.TestCase):
 
         self.assertEqual(len(client_ws.sent), 2)
         self.assertEqual(client_ws.sent[1]["otp"], "222222")
+
 
 
 def tearDownModule():

@@ -285,3 +285,101 @@ export DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/orbitalcore
 
 `ensure_schema_columns()` uses plain `ALTER TABLE ... ADD COLUMN`, so it runs on both
 SQLite and PostgreSQL.
+
+## Device / SIM Ping API
+
+The Android SMS Relay app sends periodic heartbeat pings to indicate SIM and service health.
+
+### 1. Record Heartbeat Ping
+
+```http
+POST /api/ping
+Content-Type: application/json
+```
+
+```json
+{
+  "phone": "01712345678",
+  "slot": 0,
+  "interval_minutes": 15,
+  "status": "online"
+}
+```
+
+Response:
+```json
+{
+  "success": true,
+  "message": "Ping recorded successfully",
+  "ping": {
+    "phone": "01712345678",
+    "slot": 0,
+    "interval_minutes": 15,
+    "status": "online",
+    "message": "PING | phone=01712345678 | SIM 1 | status=online",
+    "updated_at": "2026-11-26T04:15:00.000000"
+  }
+}
+```
+
+### 2. List All Pings
+
+```http
+GET /api/ping
+```
+
+### 3. Get Single SIM Ping
+
+```http
+GET /api/ping/01712345678
+```
+
+> **Note on OTP safety:** The server also intercepts legacy pings sent to `POST /api/messages` (with `message_pub="PING"` or message starting with `"PING |"`), routing them directly to the `device_ping` store and never overwriting `otp_message`.
+
+## CLI Controller & Base URL Console
+
+The server does not require a bulky HTML dashboard; instead, it features a fast, minimal CLI controller:
+
+### 1. Terminal CLI Controller (`cli.py`)
+Run from terminal to inspect pings, retrieve OTPs, monitor in real time, or send test pings:
+
+```bash
+# Interactive REPL console
+python cli.py
+
+# View SIM relay pings formatted as text table
+python cli.py pings
+
+# Retrieve latest active OTP for a phone number
+python cli.py otp 01712345678
+
+# Watch live stream of incoming OTPs and pings
+python cli.py watch
+
+# List recent messages
+python cli.py messages
+
+# Health check
+python cli.py health
+
+# Send test ping
+python cli.py send-ping 01712345678 --slot 0
+```
+
+`cli.py` works both over HTTP (`--url http://<host>:<port>`) and with a direct local SQLite fallback (`device_auth.db`) if the HTTP server is offline.
+
+### 2. Base URL Console (`GET /`)
+- **Browser**: Opening `http://localhost:5000/` provides a dark-mode CLI terminal screen with quick-action buttons and a command prompt (`sms-cli>`) for `pings`, `otp <phone>`, `messages`, and `health`.
+- **Curl / Plain Text**: Returns plain text endpoints and usage instructions.
+- **JSON**: When `Accept: application/json` is sent, returns an endpoints directory.
+
+### 3. Direct OTP Lookup (`GET /<phone>`)
+Retrieve the latest OTP for a phone directly from the base URL:
+```bash
+# Returns plain text OTP code directly (e.g. "654321")
+curl http://localhost:5000/01712345678
+
+# Returns JSON metadata
+curl -H "Accept: application/json" http://localhost:5000/01712345678
+```
+

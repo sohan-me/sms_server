@@ -4,6 +4,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -449,9 +450,10 @@ class WebSocketEndToEndTests(unittest.TestCase):
                 second_server.stdout.close()
 
     def _start_server(self, port):
+        python_bin = sys.executable or os.path.join(os.path.dirname(__file__), ".venv", "bin", "python")
         return subprocess.Popen(
             [
-                os.path.join(os.path.dirname(__file__), "venv", "bin", "python"),
+                python_bin,
                 "-c",
                 (
                     "from app import app; "

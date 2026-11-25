@@ -9,10 +9,11 @@ from functools import wraps
 
 from flask import (
     Flask,
+    Response,
     flash,
     jsonify,
     redirect,
-    render_template,
+    render_template_string,
     request,
     session,
     url_for,
@@ -26,6 +27,7 @@ from otp_core import match_signatures
 from models import (
     DEFAULT_MESSAGE_PUB,
     AdminUser,
+    DevicePing,
     DeviceUser,
     OTPMessage,
     db,
@@ -180,6 +182,15 @@ def _extract_normalized_otp(raw):
         return max(runs, key=len)
 
     return ""
+
+
+def _extract_otp_for_pub(raw, message_pub):
+    """Extract OTP digits using publisher-specific rules (IVAC vs VFS)."""
+    pub = str(message_pub or "").strip().upper()
+    if pub == "IVAC":
+        return _extract_normalized_otp(raw)
+    m = re.search(r"\b(\d{6})\b", str(raw or ""))
+    return m.group(1) if m else ""
 
 
 def _format_bdt(dt=None):
@@ -448,7 +459,7 @@ def _poll_otps_from_db(stop_event, interval=0.5):
                 )
                 for row in rows:
                     last_seen_revision = row.revision
-                    digits = _extract_normalized_otp(row.otp_message)
+                    digits = _extract_otp_for_pub(row.otp_message, row.message_pub)
                     if not digits:
                         continue
                     _broadcast_otp(
@@ -644,25 +655,347 @@ with app.app_context():
 app.otp_db_poller = _start_db_poller()
 
 
-def requires_admin_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "admin_id" not in session:
-            flash("Please log in to access this page.", "warning")
-            return redirect(url_for("admin_login"))
-        return f(*args, **kwargs)
+# ── CLI Console HTML ───────────────────────────────────────────
 
-    return decorated
+CLI_CONSOLE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SMS Server // CLI Console</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      background-color: #0c0d0e;
+      color: #39ff14;
+      font-family: "Courier New", Courier, monospace;
+      margin: 0;
+      padding: 16px;
+    }
+    .term-box {
+      max-width: 960px;
+      margin: 0 auto;
+      border: 1px solid #1f3b1f;
+      border-radius: 6px;
+      background: #000;
+      box-shadow: 0 4px 20px rgba(0, 255, 0, 0.08);
+      overflow: hidden;
+    }
+    .term-header {
+      background: #111811;
+      border-bottom: 1px solid #1f3b1f;
+      padding: 10px 16px;
+      color: #a3e635;
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .term-actions {
+      padding: 10px 16px;
+      background: #0a0e0a;
+      border-bottom: 1px solid #182a18;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button {
+      background: #142814;
+      color: #79f244;
+      border: 1px solid #2d5a2d;
+      padding: 6px 12px;
+      font-family: inherit;
+      font-size: 13px;
+      cursor: pointer;
+      border-radius: 3px;
+    }
+    button:hover { background: #1c3c1c; border-color: #39ff14; color: #fff; }
+    .term-body {
+      padding: 16px;
+      min-height: 400px;
+      max-height: 600px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #e2e8f0;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .term-input-row {
+      display: flex;
+      border-top: 1px solid #1f3b1f;
+      background: #0a0e0a;
+      padding: 10px 16px;
+      align-items: center;
+      gap: 8px;
+    }
+    .term-prompt {
+      color: #39ff14;
+      font-weight: bold;
+      user-select: none;
+    }
+    .term-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #39ff14;
+      font-family: inherit;
+      font-size: 14px;
+      outline: none;
+    }
+    .b-dim { color: #64748b; }
+  </style>
+</head>
+<body>
+  <div class="term-box">
+    <div class="term-header">
+      <span>SMS SERVER // CLI CONSOLE</span>
+      <span class="b-dim" id="clock"></span>
+    </div>
+    <div class="term-actions">
+      <button onclick="runCommand('pings')">📡 View Ping Messages</button>
+      <button onclick="promptOtp()">🔑 Retrieve OTP</button>
+      <button onclick="runCommand('messages')">📨 Recent OTP Messages</button>
+      <button onclick="runCommand('health')">🩺 Server Health</button>
+      <button onclick="clearScreen()">🧹 Clear</button>
+    </div>
+    <div class="term-body" id="screen">Ready. Type a command below or click an action button above.
+Available commands:
+  • pings               : View SIM relay heartbeat ping messages
+  • otp &lt;phone&gt;         : Retrieve active OTP for phone number
+  • messages            : List recent OTP messages
+  • health              : Show server diagnostics & fanout path
+  • clear               : Clear output screen
+  • help                : Display this help message
+</div>
+    <div class="term-input-row">
+      <span class="term-prompt">sms-cli&gt;</span>
+      <input type="text" id="cmdInput" class="term-input" placeholder="Type command (e.g. 'pings' or 'otp 017XXXXXXXX') and press Enter" autofocus autocomplete="off" />
+      <button onclick="submitInput()">Enter</button>
+    </div>
+  </div>
+
+  <script>
+    function updateClock() {
+      document.getElementById('clock').textContent = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+    }
+    setInterval(updateClock, 1000); updateClock();
+
+    const screen = document.getElementById('screen');
+    const input = document.getElementById('cmdInput');
+
+    function log(msg, color) {
+      const line = document.createElement('div');
+      if (color) line.style.color = color;
+      line.textContent = msg;
+      screen.appendChild(line);
+      screen.scrollTop = screen.scrollHeight;
+    }
+
+    function clearScreen() {
+      screen.innerHTML = '';
+      log("Console cleared.", "#64748b");
+    }
+
+    function promptOtp() {
+      const phone = prompt("Enter BD Phone Number (e.g. 017XXXXXXXX):");
+      if (phone) runCommand("otp " + phone.trim());
+    }
+
+    async function runCommand(raw) {
+      const cmd = raw.trim();
+      if (!cmd) return;
+      log("\\nsms-cli> " + cmd, "#39ff14");
+
+      const parts = cmd.split(/\\s+/);
+      const action = parts[0].toLowerCase();
+      const arg = parts.slice(1).join(" ");
+
+      if (action === "clear") {
+        clearScreen();
+        return;
+      }
+      if (action === "help") {
+        log("Commands:\\n  pings          - View device ping messages\\n  otp <phone>    - Retrieve latest OTP for phone\\n  messages       - View recent messages\\n  health         - Check server health\\n  clear          - Clear console", "#a3e635");
+        return;
+      }
+      if (action === "pings" || action === "ping") {
+        try {
+          const res = await fetch("/api/ping");
+          const data = await res.json();
+          const list = data.pings || [];
+          if (list.length === 0) {
+            log("No device pings recorded yet.", "#f59e0b");
+            return;
+          }
+          let out = "═".repeat(88) + "\\n";
+          out += "PHONE        | SIM SLOT | STATUS | INTERVAL | LAST PING (BDT)     | MESSAGE\\n";
+          out += "─".repeat(88) + "\\n";
+          list.forEach(p => {
+            const slotStr = p.slot !== null ? "SIM " + (p.slot + 1) : "SIM ?";
+            out += (p.phone || "").padEnd(12) + " | " +
+                   slotStr.padEnd(8) + " | " +
+                   (p.status || "online").padEnd(6) + " | " +
+                   ((p.interval_minutes || 15) + "m").padEnd(8) + " | " +
+                   (p.updated_at || "").padEnd(19) + " | " +
+                   (p.message || "") + "\\n";
+          });
+          out += "═".repeat(88) + "\\nTotal: " + list.length + " relay(s)";
+          log(out, "#e2e8f0");
+        } catch (err) {
+          log("Error fetching pings: " + err.message, "#ff6b7a");
+        }
+        return;
+      }
+      if (action === "otp") {
+        const phone = parts[1] || "";
+        const pub = parts[2] || "";
+        if (!phone) {
+          log("Usage: otp <phone_number> [vfs|ivac]", "#f59e0b");
+          return;
+        }
+        try {
+          const qs = pub ? "?pub=" + encodeURIComponent(pub) : "";
+          const res = await fetch("/api/messages/" + encodeURIComponent(phone) + qs);
+          const data = await res.json();
+          if (!data || !data.message) {
+            log("No active OTP found for phone: " + phone, "#f59e0b");
+          } else {
+            let out = "─".repeat(50) + "\\n";
+            out += "Phone:        " + phone + "\\n";
+            out += "OTP Code:     " + data.message + "\\n";
+            out += "Publisher:    " + (data.message_pub || "IVAC") + "\\n";
+            out += "Last Updated: " + (data.last_updated || "N/A") + " BDT\\n";
+            out += "Revision:     " + (data.revision || 0) + "\\n";
+            out += "─".repeat(50);
+            log(out, "#a3e635");
+          }
+        } catch (err) {
+          log("Error retrieving OTP: " + err.message, "#ff6b7a");
+        }
+        return;
+      }
+      if (action === "messages") {
+        try {
+          const res = await fetch("/api/messages");
+          const data = await res.json();
+          const msgs = data.messages || [];
+          if (msgs.length === 0) {
+            log("No recent messages in retention window.", "#f59e0b");
+            return;
+          }
+          let out = "═".repeat(70) + "\\n";
+          out += "PHONE        | PUB  | REVISION | LAST UPDATED (BDT)\\n";
+          out += "─".repeat(70) + "\\n";
+          msgs.forEach(m => {
+            out += (m.phone || "").padEnd(12) + " | " +
+                   (m.message_pub || "").padEnd(4) + " | " +
+                   String(m.revision || 0).padEnd(8) + " | " +
+                   (m.last_updated || "") + "\\n";
+          });
+          out += "═".repeat(70);
+          log(out, "#e2e8f0");
+        } catch (err) {
+          log("Error fetching messages: " + err.message, "#ff6b7a");
+        }
+        return;
+      }
+      if (action === "health") {
+        try {
+          const res = await fetch("/api/health");
+          const data = await res.json();
+          log(JSON.stringify(data, null, 2), "#a3e635");
+        } catch (err) {
+          log("Error fetching health: " + err.message, "#ff6b7a");
+        }
+        return;
+      }
+      if (/^(\\+?880|0)?1[3-9]\\d{8}$/.test(cmd)) {
+        runCommand("otp " + cmd);
+        return;
+      }
+      log("Unknown command: '" + cmd + "'. Type 'help' for available commands.", "#ff6b7a");
+    }
+
+    function submitInput() {
+      const val = input.value;
+      input.value = "";
+      runCommand(val);
+    }
+    input.addEventListener("keydown", function(e) {
+      if (e.key === "Enter") submitInput();
+    });
+  </script>
+</body>
+</html>
+"""
 
 
-# ── Health / root ──────────────────────────────────────────────
+# ── Health / Root CLI Console ──────────────────────────────────
 
 
 @app.route("/")
 def index():
-    if "admin_id" in session:
-        return redirect(url_for("admin_dashboard"))
-    return redirect(url_for("admin_login"))
+    accept = request.headers.get("Accept", "")
+    user_agent = request.headers.get("User-Agent", "").lower()
+
+    if "curl" in user_agent or "httpie" in user_agent or "text/plain" in accept:
+        base = request.host_url.rstrip("/")
+        text = f"""=== SMS Server CLI Console ===
+Base URL: {base}
+
+Endpoints:
+  GET  /api/ping             - List all device pings (JSON)
+  GET  /api/ping/<phone>     - Get ping for phone (JSON)
+  GET  /api/messages         - List recent OTP messages (JSON)
+  GET  /api/messages/<phone> - Retrieve latest OTP for phone (JSON)
+  GET  /<phone>              - Direct OTP lookup for phone (Text / JSON)
+  GET  /api/health           - Server health check (JSON)
+
+Terminal CLI:
+  Run `python cli.py` in terminal for interactive CLI controller.
+"""
+        return Response(text, mimetype="text/plain")
+
+    if "application/json" in accept and "text/html" not in accept:
+        return jsonify(
+            {
+                "service": "sms_server",
+                "status": "online",
+                "endpoints": {
+                    "messages": "/api/messages",
+                    "messages_by_phone": "/api/messages/<phone>",
+                    "pings": "/api/ping",
+                    "ping_by_phone": "/api/ping/<phone>",
+                    "direct_otp": "/<phone>",
+                    "health": "/api/health",
+                },
+                "cli": "Run `python cli.py` in terminal for interactive controller",
+            }
+        )
+
+    return render_template_string(CLI_CONSOLE_HTML)
+
+
+@app.route("/<phone>", methods=["GET"])
+def direct_get_otp(phone):
+    norm = normalize_bd_phone(phone)
+    if not norm or not re.fullmatch(r"01[3-9]\d{8}", norm):
+        return jsonify({"error": "Invalid phone number format"}), 404
+
+    user_agent = request.headers.get("User-Agent", "").lower()
+    accept = request.headers.get("Accept", "")
+
+    resp, status_code = api_get_messages(norm)
+    data = resp.get_json() if hasattr(resp, "get_json") else {}
+
+    if ("curl" in user_agent or "text/plain" in accept) and "application/json" not in accept:
+        digits = data.get("message")
+        if digits:
+            return Response(f"{digits}\n", mimetype="text/plain", status=status_code)
+        return Response("NO_OTP_FOUND\n", mimetype="text/plain", status=status_code)
+
+    return resp, status_code
 
 
 @app.route("/api/health")
@@ -791,6 +1124,95 @@ def api_authenticate():
     ), 200
 
 
+# ── Device / SIM Ping HTTP ───────────────────────────────────────
+
+
+def _record_device_ping(phone, slot=None, interval_minutes=15, status="online", message=None):
+    if not phone:
+        return None
+    phone = normalize_bd_phone(phone) or str(phone).strip()
+    now = datetime.utcnow()
+    row = DevicePing.query.filter_by(phone=phone).first()
+    if not row:
+        row = DevicePing(phone=phone)
+        db.session.add(row)
+    if slot is not None:
+        try:
+            row.slot = int(slot)
+        except (ValueError, TypeError):
+            pass
+    if interval_minutes is not None:
+        try:
+            row.interval_minutes = int(interval_minutes)
+        except (ValueError, TypeError):
+            pass
+    row.status = str(status or "online")[:50]
+    if message is not None:
+        row.message = str(message)[:199]
+    row.updated_at = now
+    db.session.commit()
+    return row
+
+
+@app.route("/api/ping", methods=["POST"])
+@app.route("/api/ping/", methods=["POST"])
+def api_device_ping():
+    data = request.json or {}
+    if not data:
+        return jsonify({"error": "Invalid payload"}), 400
+
+    phone = normalize_bd_phone(data.get("phone"))
+    if not phone:
+        return jsonify({"error": "Missing or invalid phone"}), 400
+
+    slot = data.get("slot")
+    interval = data.get("interval_minutes") or data.get("interval")
+    status = data.get("status") or "online"
+    message = data.get("message")
+
+    if not message:
+        slot_str = f"SIM {int(slot) + 1}" if slot is not None else "SIM ?"
+        message = f"PING | phone={phone} | {slot_str} | status={status}"
+
+    row = _record_device_ping(
+        phone=phone,
+        slot=slot,
+        interval_minutes=interval or 15,
+        status=status,
+        message=message,
+    )
+
+    return (
+        jsonify(
+            {
+                "success": True,
+                "message": "Ping recorded successfully",
+                "ping": row.to_dict(),
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/ping", methods=["GET"])
+@app.route("/api/ping/", methods=["GET"])
+def api_list_pings():
+    rows = DevicePing.query.order_by(DevicePing.updated_at.desc()).all()
+    return jsonify({"pings": [r.to_dict() for r in rows]}), 200
+
+
+@app.route("/api/ping/<phone>", methods=["GET"], strict_slashes=False)
+def api_get_ping(phone):
+    norm = normalize_bd_phone(phone)
+    raw_key = str(phone or "").strip()
+    row = DevicePing.query.filter(
+        or_(DevicePing.phone == norm, DevicePing.phone == raw_key)
+    ).first()
+    if not row:
+        return jsonify({"error": "Ping record not found"}), 404
+    return jsonify({"ping": row.to_dict()}), 200
+
+
 # ── SMS OTP HTTP ───────────────────────────────────────────────
 
 
@@ -811,7 +1233,24 @@ def api_add_message():
     raw_pub = data.get("message_pub")
     if raw_pub is None or not str(raw_pub).strip():
         raw_pub = data.get("messagePub")
-    message_pub = str(raw_pub or "").strip().upper()
+    raw_pub_upper = str(raw_pub or "").strip().upper()
+
+    # Safeguard: if forwarder sent a heartbeat ping to /api/messages, record it
+    # without corrupting the OTP table or publishing false OTPs.
+    if raw_pub_upper == "PING" or str(message).startswith("PING |"):
+        row = _record_device_ping(phone, message=str(message)[:199])
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "message": "Ping recorded successfully",
+                    "ping": row.to_dict() if row else None,
+                }
+            ),
+            200,
+        )
+
+    message_pub = raw_pub_upper
     if message_pub not in ("VFS", "IVAC"):
         message_pub = DEFAULT_MESSAGE_PUB
 
@@ -845,13 +1284,7 @@ def api_add_message():
 
     # Only normalize OTP for IVAC (word-based OTPs like "ONE_TWO_THREE" or spaced digits "2-5-7-0-0-7").
     # VFS already sends normalized digit OTPs, so skip normalization for VFS to avoid false matches.
-    if message_pub == "IVAC":
-        otp_digits = _extract_normalized_otp(message)
-    else:
-        # For VFS, just extract digit OTP directly (6 digits)
-        import re
-        m = re.search(r"\b(\d{6})\b", message)
-        otp_digits = m.group(1) if m else ""
+    otp_digits = _extract_otp_for_pub(message, message_pub)
 
     if otp_digits:
         otp_broker.publish(
@@ -882,7 +1315,12 @@ def api_list_messages():
     db.session.commit()
 
     q = OTPMessage.query.filter(OTPMessage.updated_at >= expiry_threshold)
-    wanted_pub = (request.args.get("message_pub") or "").strip().upper()
+    wanted_pub = (
+        request.args.get("pub")
+        or request.args.get("message_pub")
+        or request.args.get("messagePub")
+        or ""
+    ).strip().upper()
     if wanted_pub in ("VFS", "IVAC"):
         q = q.filter(OTPMessage.message_pub == wanted_pub)
     rows = q.order_by(OTPMessage.updated_at.desc()).limit(200).all()
@@ -934,20 +1372,20 @@ def api_get_messages(phone):
     if since_revision is not None and int(row.revision or 0) <= since_revision:
         return jsonify({}), 200
 
-    # Optional publisher filter. Omitted keeps the historical "latest row"
-    # behaviour so existing clients are unaffected.
-    wanted_pub = (request.args.get("message_pub") or "").strip().upper()
+    # Optional publisher filter. Supports ?pub=, ?message_pub=, and ?messagePub=.
+    # Omitted keeps the historical "latest row" behaviour so existing clients
+    # are unaffected.
+    wanted_pub = (
+        request.args.get("pub")
+        or request.args.get("message_pub")
+        or request.args.get("messagePub")
+        or ""
+    ).strip().upper()
     stored_pub = (row.message_pub or "").strip().upper()
     if wanted_pub in ("VFS", "IVAC") and stored_pub != wanted_pub:
         return jsonify({}), 200
 
-    if stored_pub == "IVAC":
-        digits = _extract_normalized_otp(row.otp_message)
-    else:
-        # For VFS, just extract digit OTP directly (6 digits)
-        import re
-        m = re.search(r"\b(\d{6})\b", row.otp_message)
-        digits = m.group(1) if m else ""
+    digits = _extract_otp_for_pub(row.otp_message, stored_pub)
 
     if not digits:
         return jsonify({}), 200
@@ -994,146 +1432,6 @@ def ws_otp(ws):
         return
 
     ws.close(4001, "Unauthorized")
-
-
-# ── Admin auth ─────────────────────────────────────────────────
-
-
-@app.route("/login", methods=["GET", "POST"])
-def admin_login():
-    if "admin_id" in session:
-        return redirect(url_for("admin_dashboard"))
-    if request.method == "POST":
-        username = (request.form.get("username") or "").strip()
-        password = request.form.get("password") or ""
-        admin = AdminUser.query.filter_by(username=username).first()
-        if admin and admin.check_password(password):
-            session["admin_id"] = admin.id
-            session["username"] = admin.username
-            return redirect(url_for("admin_dashboard"))
-        flash("Invalid username or password.", "danger")
-    return render_template("login.html")
-
-
-@app.route("/logout")
-def admin_logout():
-    session.clear()
-    flash("Logged out.", "success")
-    return redirect(url_for("admin_login"))
-
-
-@app.route("/admin")
-@requires_admin_auth
-def admin_dashboard():
-    users = DeviceUser.query.order_by(DeviceUser.created_at.desc()).all()
-    return render_template("admin.html", users=users)
-
-
-@app.route("/admin/users/add", methods=["POST"])
-@requires_admin_auth
-def admin_add_user():
-    name = (request.form.get("name") or "").strip()
-    data = {
-        "mac_address": request.form.get("mac_address"),
-        "motherboard_serial": request.form.get("motherboard_serial"),
-        "machine_guid": request.form.get("machine_guid"),
-        "bios_serial": request.form.get("bios_serial"),
-    }
-    mac, mb, guid, bios, sig_count = _normalize_device_signatures(data)
-    if not name:
-        flash("Name is required.", "danger")
-        return redirect(url_for("admin_dashboard"))
-    if sig_count < MIN_SIGNATURE_FIELDS:
-        flash("At least 2 device signature fields are required.", "danger")
-        return redirect(url_for("admin_dashboard"))
-    if mac and DeviceUser.query.filter_by(mac_address=mac).first():
-        flash("A user with that MAC already exists.", "danger")
-        return redirect(url_for("admin_dashboard"))
-
-    active = request.form.get("is_active") == "1"
-    user = DeviceUser(
-        name=name,
-        mac_address=mac,
-        motherboard_serial=mb,
-        machine_guid=guid,
-        bios_serial=bios,
-        ws_token=generate_ws_token(),
-        is_active=active,
-    )
-    db.session.add(user)
-    db.session.commit()
-    flash(f"User {name} created.", "success")
-    return redirect(url_for("admin_dashboard"))
-
-
-@app.route("/admin/toggle/<int:user_id>", methods=["POST"])
-@requires_admin_auth
-def toggle_user(user_id):
-    user = DeviceUser.query.get_or_404(user_id)
-    user.is_active = not user.is_active
-    db.session.commit()
-    if not user.is_active:
-        _drop_user_ws(user.id)
-    action = "activated" if user.is_active else "deactivated"
-    flash(f"User {user.name or 'Unnamed'} has been {action}.", "success")
-    return redirect(url_for("admin_dashboard"))
-
-
-@app.route("/admin/user/<int:user_id>/expiry", methods=["POST"])
-@requires_admin_auth
-def update_user_expiry(user_id):
-    user = DeviceUser.query.get_or_404(user_id)
-    if request.form.get("clear_expiry") == "1":
-        user.expires_at = None
-        db.session.commit()
-        flash("Expiry cleared.", "success")
-        return redirect(url_for("admin_dashboard"))
-
-    raw = (request.form.get("expires_at") or "").strip()
-    if not raw:
-        user.expires_at = None
-        db.session.commit()
-        flash("Expiry cleared.", "success")
-        return redirect(url_for("admin_dashboard"))
-
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        user.expires_at = dt
-    except ValueError:
-        flash("Invalid expiry date.", "danger")
-        return redirect(url_for("admin_dashboard"))
-
-    if user.expires_at <= datetime.utcnow():
-        user.is_active = False
-        _drop_user_ws(user.id)
-    db.session.commit()
-    flash("Expiry updated (UTC).", "success")
-    return redirect(url_for("admin_dashboard"))
-
-
-@app.route("/admin/user/<int:user_id>/regen-token", methods=["POST"])
-@requires_admin_auth
-def regen_user_ws_token(user_id):
-    user = DeviceUser.query.get_or_404(user_id)
-    user.rotate_ws_token()
-    db.session.commit()
-    _drop_user_ws(user.id)
-    flash(f"Auth token regenerated for {user.name or 'Unnamed'}.", "success")
-    return redirect(url_for("admin_dashboard"))
-
-
-@app.route("/admin/delete/<int:user_id>", methods=["POST"])
-@requires_admin_auth
-def delete_user(user_id):
-    user = DeviceUser.query.get_or_404(user_id)
-    display = user.name or "Unnamed"
-    _drop_user_ws(user.id)
-    db.session.delete(user)
-    db.session.commit()
-    flash(f"User {display} deleted.", "danger")
-    return redirect(url_for("admin_dashboard"))
 
 
 if __name__ == "__main__":

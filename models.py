@@ -96,3 +96,31 @@ class OTPRevision(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     value = db.Column(db.BigInteger, nullable=False, default=0)
+
+
+class DevicePing(db.Model):
+    """Heartbeat ping record from SMS relay devices / SIM cards."""
+
+    __tablename__ = "device_ping"
+
+    id = db.Column(db.Integer, primary_key=True)
+    phone = db.Column(db.String(20), nullable=False, unique=True)
+    slot = db.Column(db.Integer, nullable=True)
+    interval_minutes = db.Column(db.Integer, nullable=False, default=15)
+    status = db.Column(db.String(50), nullable=False, default="online")
+    message = db.Column(db.String(200), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "phone": self.phone,
+            "slot": self.slot,
+            "interval_minutes": self.interval_minutes,
+            "status": self.status,
+            "message": self.message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
